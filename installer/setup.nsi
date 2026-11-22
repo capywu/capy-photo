@@ -1,6 +1,6 @@
 Unicode true
 !define APP "Capy Photo"
-!define VER "1.2.0"
+!define VER "1.3.0"
 !define SRC "..\dist\win-unpacked"
 Name "${APP} ${VER}"
 OutFile "..\dist\CapyPhoto-${VER}-Setup.exe"
@@ -10,7 +10,7 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Icon "..\build\icon.ico"
 UninstallIcon "..\build\icon.ico"
-VIProductVersion "1.2.0.0"
+VIProductVersion "1.3.0.0"
 VIAddVersionKey "ProductName" "Capy Photo"
 VIAddVersionKey "FileDescription" "Capy Photo 安裝程式"
 VIAddVersionKey "FileVersion" "${VER}"

@@ -1,6 +1,6 @@
 // AI：人臉偵測、臉部網格、閉眼判斷、人像分割，以及修圖遮罩與液化控制點
 import { Human } from '../node_modules/@vladmandic/human/dist/human.esm.js';
-import { estimateDepth } from './ml.js';
+import { estimateDepth, parseHair } from './ml.js';
 
 let human = null, loading = null;
 export async function initAI() {
@@ -233,7 +233,15 @@ export async function buildMasks(imgData) {
   }
   // ── 頭髮：頭部範圍內、人物遮罩內、顏色接近頭頂取樣的頭髮色 ──
   const hairA = new Float32Array(W * H);
-  if (person) for (const f of faces) {
+  // 先用臉部解析神經網路找整片頭髮（含兩側、馬尾、長髮）；失敗才用顏色模型
+  let parsed = false;
+  for (const f of faces) {
+    try { const m = f.mesh; let bx = [1e9, 1e9, -1e9, -1e9]; for (const p of m) { bx[0] = Math.min(bx[0], p[0]); bx[1] = Math.min(bx[1], p[1]); bx[2] = Math.max(bx[2], p[0]); bx[3] = Math.max(bx[3], p[1]); }
+      await parseHair(imgData, W, H, bx, hairA); parsed = true; } catch (err) { console.warn('hair parse', err); }
+  }
+  if (parsed && person) for (let i = 0; i < W * H; i++) { const pv = person[i * 4 + 3] / 255; hairA[i] = Math.min(1, Math.max(0, (hairA[i] - 0.25) / 0.5)) * Math.min(1, 0.35 + pv * 1.2); }
+  else if (parsed) for (let i = 0; i < W * H; i++) hairA[i] = Math.min(1, Math.max(0, (hairA[i] - 0.25) / 0.5));
+  if (person && !parsed) for (const f of faces) {
     const m = f.mesh; const fw = dist(m[234], m[454]), fh = dist(m[10], m[152]);
     const up = norm([m[10][0] - m[152][0], m[10][1] - m[152][1]]), rt = norm([m[454][0] - m[234][0], m[454][1] - m[234][1]]);
     const samples = [];
@@ -258,44 +266,90 @@ export async function buildMasks(imgData) {
     }
   }
   // 扣除皮膚（臉與身體）
+  const hairK = new Float32Array(W * H).fill(1);
   { const skd = skX.getImageData(0, 0, W, H).data, fcd = fcX.getImageData(0, 0, W, H).data;
     // 與膚色太接近的不算頭髮
     let ref = null; if (skinSamples.length) ref = ycc(skinSamples.reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], [0, 0, 0]).map(v => v / skinSamples.length));
     const d = imgData.data;
-    for (let i = 0; i < W * H; i++) { if (!hairA[i]) continue; let k = (1 - skd[i * 4 + 3] / 255) * (1 - fcd[i * 4 + 3] / 255);
-      if (ref) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); const dc = Math.hypot(c[1] - ref[1], c[2] - ref[2]); k *= Math.min(1, Math.max(0, (dc - 6) / 10) + (c[0] < ref[0] * 0.35 ? 1 : 0)); }
-      hairA[i] *= Math.min(1, k); } }
+    for (let i = 0; i < W * H; i++) { if (!hairA[i]) continue; let k = parsed ? (ref ? (() => { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); const dc = Math.hypot(c[1] - ref[1], c[2] - ref[2]); const dy = Math.abs(c[0] - ref[0]) / Math.max(ref[0], 1); return 1 - (1 - Math.min(1, Math.max(0, (dc - 11) / 8))) * (1 - Math.min(1, Math.max(0, (dy - 0.25) / 0.2))); })() : 1) : (1 - skd[i * 4 + 3] / 255) * (1 - fcd[i * 4 + 3] / 255);
+      if (ref && !parsed) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); const dc = Math.hypot(c[1] - ref[1], c[2] - ref[2]); k *= Math.min(1, Math.max(0, (dc - 6) / 10) + (c[0] < ref[0] * 0.35 ? 1 : 0)); }
+      hairA[i] *= Math.min(1, k); hairK[i] = Math.min(1, k); }
+    // 頭髮顏色模型：用最確定是頭髮的像素建立顏色分布，差太多的（例如撥頭髮的手、肩膀）排除
+    if (parsed) { let n = 0; const m = [0, 0, 0], q = [0, 0, 0];
+      for (let i = 0; i < W * H; i++) if (hairA[i] > 0.85) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); for (let k = 0; k < 3; k++) { m[k] += c[k]; q[k] += c[k] * c[k]; } n++; }
+      if (n > 200) { const sd = [0, 1, 2].map(k => Math.max([32, 6, 6][k], Math.sqrt(Math.max(0, q[k] / n - (m[k] / n) ** 2)))); for (let k = 0; k < 3; k++) m[k] /= n;
+        for (let i = 0; i < W * H; i++) { if (!hairA[i]) continue; const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]);
+          const z = Math.sqrt(((c[0] - m[0]) / (sd[0] * 1.4)) ** 2 + ((c[1] - m[1]) / sd[1]) ** 2 + ((c[2] - m[2]) / sd[2]) ** 2); const k2 = Math.min(1, Math.max(0, 1 - (z - 2.4) / 1.4));
+          hairA[i] *= k2; hairK[i] *= k2; } } } }
   let hair = hairA;
-  if (faces.length && person) hair = guidedFilter(gray, hairA, W, H, Math.max(2, Math.round(Math.max(W, H) / 300)), 4e-4);
+  if (faces.length && person) { hair = guidedFilter(gray, hairA, W, H, Math.max(2, Math.round(Math.max(W, H) / 300)), 4e-4); for (let i = 0; i < W * H; i++) hair[i] *= hairK[i]; }
 
-  // ── 身形：用姿勢模型找肩膀與髖部，在腰身左右邊緣放推移點 ──
+  // ── 身形：人物輪廓（含衣服）逐列量測軀幹中心與寬度，姿勢模型輔助定位肩、髖、膝（正面、側面都可）──
+  let bodyProf = null;
   try {
     if (person) {
-      const rb = await h.detect(c, { body: { enabled: true, modelPath: 'movenet-lightning.json', maxDetected: 1, minConfidence: 0.2 }, face: { enabled: false } });
+      let kp = () => null;
+      try {
+        const rb = await h.detect(c, { body: { enabled: true, modelPath: 'movenet-lightning.json', maxDetected: 1, minConfidence: 0.15 }, face: { enabled: false } });
         h.config.face.enabled = true; h.config.body.enabled = false;
-      const b = (rb.body || [])[0];
-      if (b && b.score > 0.25) {
-        const kp = (n) => { const k = b.keypoints.find(q => q.part === n); return k && k.score > 0.2 ? k.position : null; };
-        const ls = kp('leftShoulder'), rs = kp('rightShoulder'), lh = kp('leftHip'), rh = kp('rightHip'), lk = kp('leftKnee'), rk = kp('rightKnee');
-        if (ls && rs && lh && rh) {
-          const sm = [(ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2], hm = [(lh[0] + rh[0]) / 2, (lh[1] + rh[1]) / 2];
-          const axis = norm([hm[0] - sm[0], hm[1] - sm[1]]), perp = [-axis[1], axis[0]]; const th = dist(sm, hm);
-          const levels = [[0.35, 'body'], [0.55, 'waist'], [0.7, 'waist'], [0.85, 'waist'], [1.05, 'body']];
-          const km = lk && rk ? [(lk[0] + rk[0]) / 2, (lk[1] + rk[1]) / 2] : null;
-          if (km) levels.push([1.35, 'body'], [1.65, 'body']);
-          for (const [t, kind] of levels) {
-            if (t > 1 && !km) continue;
-            const base = t <= 1 ? [sm[0] + (hm[0] - sm[0]) * t, sm[1] + (hm[1] - sm[1]) * t] : [hm[0] + (km[0] - hm[0]) * (t - 1) / 0.7, hm[1] + (km[1] - hm[1]) * (t - 1) / 0.7];
-            for (const dir of [-1, 1]) {
-              let edge = null; for (let k = 0; k < th * 1.2; k += 1) { const x = Math.round(base[0] + perp[0] * dir * k), y = Math.round(base[1] + perp[1] * dir * k); if (x < 0 || y < 0 || x >= W || y >= H) break; if (person[(y * W + x) * 4 + 3] < 110) { edge = [x, y, k]; break; } }
-              if (!edge || edge[2] < th * 0.08) continue;
-              pins.push({ kind, x: edge[0] / W, y: edge[1] / H, r: th * (kind === 'waist' ? 0.3 : 0.35) / H, dx: -perp[0] * dir * edge[2] / W, dy: -perp[1] * dir * edge[2] / H });
-            }
-          }
+        const b = (rb.body || [])[0];
+        if (b && b.score > 0.15) kp = (n) => { const k = b.keypoints.find(q => q.part === n); return k && k.score > 0.2 ? k.position : null; };
+      } catch (err) { console.warn('pose', err); }
+      const avg = (...ps) => { ps = ps.filter(Boolean); return ps.length ? [ps.reduce((s2, p) => s2 + p[0], 0) / ps.length, ps.reduce((s2, p) => s2 + p[1], 0) / ps.length] : null; };
+      const sh = avg(kp('leftShoulder'), kp('rightShoulder')), hip = avg(kp('leftHip'), kp('rightHip')), knee = avg(kp('leftKnee'), kp('rightKnee'));
+      // 人物遮罩上下範圍
+      let top = H, bot = -1; for (let y = 0; y < H; y++) for (let x = 0; x < W; x += 2) if (person[(y * W + x) * 4 + 3] > 128) { if (y < top) top = y; bot = y; break; }
+      const fbx = faces.map(f => [f.box[0] / W, f.box[1] / H, (f.box[0] + f.box[2]) / W, (f.box[1] + f.box[3]) / H]);
+      const face = fbx.length ? fbx.reduce((a2, b2) => (b2[3] - b2[1] > a2[3] - a2[1] ? b2 : a2)) : null;
+      const fh = face ? (face[3] - face[1]) * H : (bot - top) * 0.12;
+      let ys = sh ? sh[1] : face ? face[3] * H + fh * 0.45 : top + (bot - top) * 0.18;
+      const yHip = hip ? hip[1] : ys + fh * 2.6;
+      let ye = knee ? knee[1] : Math.min(bot, yHip + fh * 2.2);
+      ye = Math.min(ye, bot - 2, H - 2);
+      if (bot - top > H * 0.2 && ye - ys > fh * 1.2) {
+        const N = 48, rows = []; let pcx = sh ? sh[0] : face ? (face[0] + face[2]) / 2 * W : null, phw = null;
+        if (pcx == null) { let sx = 0, n = 0; const yy = Math.round(ys + (ye - ys) * 0.3); for (let x = 0; x < W; x++) if (person[(yy * W + x) * 4 + 3] > 128) { sx += x; n++; } pcx = n ? sx / n : W / 2; }
+        const rawRows = [];
+        { // 先在腰部量一次寬度當基準（手臂通常已經離開軀幹）
+          const yw = Math.round(ys + (yHip - ys) * 0.65); const gx0 = sh && hip ? sh[0] + (hip[0] - sh[0]) * 0.65 : pcx; let x0 = Math.round(gx0);
+          const rw = (x) => person[(yw * W + Math.max(0, Math.min(W - 1, x))) * 4 + 3] > 120;
+          if (!rw(x0)) for (let k = 1; k < W * 0.06; k++) { if (rw(x0 - k)) { x0 -= k; break; } if (rw(x0 + k)) { x0 += k; break; } }
+          if (rw(x0)) { let l = x0, r = x0; while (l > 0 && rw(l - 1)) l--; while (r < W - 1 && rw(r + 1)) r++; phw = (r - l) / 2; if (sh) phw = Math.min(phw, Math.max(fh * 1.1, 8)); }
+        }
+        for (let i = 0; i < N; i++) {
+          const y = Math.round(ys + (ye - ys) * (i + 0.5) / N); const t = (y - ys) / (yHip - ys);
+          // 姿勢模型的中心線（肩→髖→膝）
+          let gx = pcx; if (sh && hip && t <= 1) gx = sh[0] + (hip[0] - sh[0]) * t; else if (hip && knee && t > 1) gx = hip[0] + (knee[0] - hip[0]) * Math.min(1, (y - hip[1]) / Math.max(1, knee[1] - hip[1]));
+          const row = (x) => person[(y * W + Math.max(0, Math.min(W - 1, Math.round(x)))) * 4 + 3] > 120;
+          let l = null, r = null; const x0 = Math.round(gx);
+          if (row(x0)) { l = x0; r = x0; while (l > 0 && row(l - 1)) l--; while (r < W - 1 && row(r + 1)) r++; }
+          else if (phw != null) { // 中心不在人物上（兩腿之間）：取左右最近的兩段
+            const lim = phw * 1.45 + 3; for (let x = Math.round(gx - lim); x <= Math.round(gx + lim); x++) if (x >= 0 && x < W && row(x)) { if (l == null) l = x; r = x; }
+          } else { for (let k = 1; k < W * 0.06; k++) { if (row(x0 - k)) { l = r = x0 - k; break; } if (row(x0 + k)) { l = r = x0 + k; break; } } if (l != null) { while (l > 0 && row(l - 1)) l--; while (r < W - 1 && row(r + 1)) r++; } }
+          rawRows.push(l == null ? null : [l, r, gx]);
+          if (l != null && phw != null && (r - l) / 2 > phw * 1.6) { const cc = Math.min(Math.max(gx, l + phw), r - phw); l = Math.max(l, cc - phw * 1.25); r = Math.min(r, cc + phw * 1.25); } // 手臂貼著身體造成的突出
+          if (l == null || r - l < 3) { rows.push(null); continue; }
+          const cx = (l + r) / 2, hw = (r - l) / 2; rows.push([y, cx, hw]); pcx = sh ? pcx : cx; if (phw != null) phw = phw * 0.7 + Math.min(hw, phw * 1.3) * 0.3;
+        }
+        const ok = rows.filter(Boolean);
+        if (ok.length > N * 0.6) {
+          // 補空、平滑、限制手臂造成的突出
+          for (let i = 0; i < N; i++) if (!rows[i]) { const p = rows.slice(0, i).reverse().find(Boolean), q = rows.slice(i).find(Boolean); rows[i] = [ys + (ye - ys) * (i + 0.5) / N, ((p || q)[1] + (q || p)[1]) / 2, ((p || q)[2] + (q || p)[2]) / 2]; }
+          const med = ok.map(r2 => r2[2]).sort((a2, b2) => a2 - b2)[Math.floor(ok.length / 2)];
+          for (const r2 of rows) r2[2] = Math.min(r2[2], med * 1.5);
+          const sm = (k) => rows.map((_, i) => { let s2 = 0, n = 0; for (let j = Math.max(0, i - 3); j <= Math.min(N - 1, i + 3); j++) { s2 += rows[j][k]; n++; } return s2 / n; });
+          const scx = sm(1), shw = sm(2);
+          const tw = (yHip - ys) * 0.62 + ys, sig = (yHip - ys) * 0.24;
+          bodyProf = { y0: ys / H, y1: ye / H, rows: rows.map((r2, i) => {
+            const y = ys + (ye - ys) * (i + 0.5) / N; const u = (i + 0.5) / N;
+            const taper = Math.max(0, Math.min(1, (u - 0.04) / 0.3, (1 - u) / 0.12));
+            return [scx[i] / W, shw[i] / W, Math.exp(-0.5 * ((y - tw) / sig) ** 2) * taper, taper];
+          }) };
         }
       }
     }
-  } catch (err) { console.warn('pose', err); }
+  } catch (err) { console.warn('body', err); }
+  if (bodyProf) pins.push({ kind: 'bodyProf', prof: bodyProf });
 
   // ── 水面：天空以下、非人物、紋理平滑、偏藍/青/灰綠，取最大連通區域 ──
   const water = waterMask(imgData, person, sky0 => sky0, gray);
@@ -326,7 +380,7 @@ export async function buildMasks(imgData) {
   for (let i = 0; i < W * H; i++) {
     m1[i * 4] = A(sk, i); m1[i * 4 + 1] = A(ue, i); m1[i * 4 + 2] = A(th, i); m1[i * 4 + 3] = A(ey, i);
     m2[i * 4] = person ? person[i * 4 + 3] : 0; m2[i * 4 + 1] = sky[i]; m2[i * 4 + 2] = A(hi, i); m2[i * 4 + 3] = A(lo, i);
-    m4[i * 4] = hair[i] * 255; m4[i * 4 + 1] = water[i]; m4[i * 4 + 3] = 255;
+    m4[i * 4] = hair[i] * 255; m4[i * 4 + 1] = water[i]; m4[i * 4 + 3] = sky.region ? sky.region[i] : 0;
     m3[i * 4] = A(lp, i); m3[i * 4 + 1] = A(br, i); m3[i * 4 + 2] = A(fc, i); m3[i * 4 + 3] = A(bl, i);
   }
   let skinRef = null;
@@ -335,11 +389,14 @@ export async function buildMasks(imgData) {
   let depth = null;
   try { depth = await estimateDepth(imgData, W, H); for (let i = 0; i < W * H; i++) m4[i * 4 + 2] = Math.round(depth[i] * 255); } catch (err) { console.warn('depth', err); }
   const faceFrac = faces.length ? Math.max(...faces.map(f => dist(f.mesh[234], f.mesh[454]))) / Math.max(W, H) : 0.25;
+  let skyRef = null, fgRef = null;
+  if (sky.region) { try { skyRef = pushPullRef(imgData, (i) => sky[i] > 200 ? 1 : 0); fgRef = pushPullRef(imgData, (i) => sky.region[i] < 40 || (sky[i] < 20 && sky.region[i] < 200) ? 1 : 0); } catch (err) { console.warn('skyref', err); } }
   let skyBottom = 0, skyN = 0; for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 4) if (sky[y * W + x] > 128) { skyN++; skyBottom = Math.max(skyBottom, y / H); }
   // 構圖用：主體範圍
   let bb = null; if (person) { let x0 = W, y0 = H, x1 = 0, y1 = 0; for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) if (person[(y * W + x) * 4 + 3] > 128) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); } if (x1 > x0) bb = [x0 / W, y0 / H, x1 / W, y1 / H]; }
   const faceBoxes = faces.map(f => [f.box[0] / W, f.box[1] / H, (f.box[0] + f.box[2]) / W, (f.box[1] + f.box[3]) / H]);
-  return { w: W, h: H, m1, m2, m3, m4, depth, hasDepth: !!depth, hasHair: hair.some(v => v > 0.5), hasWater: water.some(v => v > 128), hasBody: pins.some(p => p.kind === 'waist'), pins, faces: faces.length, hasPerson: !!person, skinRef, faceFrac, skyBottom: skyN > 50 ? skyBottom : 0, hasSky: skyN > 50, subject: bb, faceBoxes };
+  let hairL = 0.3; { let sw = 0, sl = 0; const dd = imgData.data; for (let i = 0; i < W * H; i++) { const w = hair[i]; if (w < 0.5) continue; sw += w; sl += w * (0.2126 * dd[i * 4] + 0.7152 * dd[i * 4 + 1] + 0.0722 * dd[i * 4 + 2]) / 255; } if (sw > 20) hairL = sl / sw; }
+  return { skyRef, fgRef, hairL, w: W, h: H, m1, m2, m3, m4, depth, hasDepth: !!depth, hasHair: hair.some(v => v > 0.5), hasWater: water.some(v => v > 128), hasBody: !!bodyProf, bodyProf, pins, faces: faces.length, hasPerson: !!person, skinRef, faceFrac, skyBottom: skyN > 50 ? skyBottom : 0, hasSky: skyN > 50, subject: bb, faceBoxes };
 }
 
 function expand(m, idx, k) {
@@ -431,7 +488,27 @@ function skyMask(img, person) {
     const ok = (b > r && l > 60) || l > 170 ? 1 : 0.15;
     out[i] = bd[i * 4 + 3] * ok;
   }
+  // 邊界帶：粗略天空範圍再往外擴，讓細節區（樹枝、電線、建築邊緣）交給逐像素的顏色分離
+  const rg = new OffscreenCanvas(W, H); const rx = rg.getContext('2d', { willReadFrequently: true }); rx.filter = `blur(${Math.max(2, W / 90)}px)`; rx.drawImage(small, 0, 0, W, H);
+  const rd = rx.getImageData(0, 0, W, H).data; out.region = new Uint8Array(W * H); for (let i = 0; i < W * H; i++) out.region[i] = Math.min(255, rd[i * 4 + 3] * 2.2);
   return out;
+}
+// 把指定權重的像素顏色往外擴散補滿（push-pull），得到每個位置附近的「天空色」或「前景色」
+function pushPullRef(img, weight, size = 160) {
+  const W = img.width, H = img.height, d = img.data; const s = size / Math.max(W, H); const w = Math.max(4, Math.round(W * s)), h = Math.max(4, Math.round(H * s));
+  let lv = { w, h, c: new Float32Array(w * h * 3), a: new Float32Array(w * h) };
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = y * W + x; const k = weight(i); if (k <= 0) continue; const j = Math.min(h - 1, (y * s) | 0) * w + Math.min(w - 1, (x * s) | 0); lv.a[j] += k; lv.c[j * 3] += d[i * 4] * k; lv.c[j * 3 + 1] += d[i * 4 + 1] * k; lv.c[j * 3 + 2] += d[i * 4 + 2] * k; }
+  const levels = [lv];
+  while (lv.w > 1 || lv.h > 1) { const nw = Math.max(1, Math.ceil(lv.w / 2)), nh = Math.max(1, Math.ceil(lv.h / 2)); const n = { w: nw, h: nh, c: new Float32Array(nw * nh * 3), a: new Float32Array(nw * nh) };
+    for (let y = 0; y < lv.h; y++) for (let x = 0; x < lv.w; x++) { const j = (y >> 1) * nw + (x >> 1), i = y * lv.w + x; n.a[j] += lv.a[i]; for (let k = 0; k < 3; k++) n.c[j * 3 + k] += lv.c[i * 3 + k]; }
+    levels.push(n); lv = n; }
+  for (let L = levels.length - 2; L >= 0; L--) { const a = levels[L], b = levels[L + 1];
+    for (let y = 0; y < a.h; y++) for (let x = 0; x < a.w; x++) { const i = y * a.w + x; const j = (y >> 1) * b.w + (x >> 1); const t = Math.min(1, a.a[i]);
+      const bc = b.a[j] > 0 ? [b.c[j * 3] / b.a[j], b.c[j * 3 + 1] / b.a[j], b.c[j * 3 + 2] / b.a[j]] : [128, 128, 128];
+      const ac = a.a[i] > 0 ? [a.c[i * 3] / a.a[i], a.c[i * 3 + 1] / a.a[i], a.c[i * 3 + 2] / a.a[i]] : bc;
+      for (let k = 0; k < 3; k++) a.c[i * 3 + k] = (ac[k] * t + bc[k] * (1 - t)); a.a[i] = 1; } }
+  const out = new Uint8Array(w * h * 4); const L0 = levels[0]; for (let i = 0; i < w * h; i++) { out[i * 4] = L0.c[i * 3]; out[i * 4 + 1] = L0.c[i * 3 + 1]; out[i * 4 + 2] = L0.c[i * 3 + 2]; out[i * 4 + 3] = 255; }
+  return { w, h, data: out };
 }
 
 // 依修圖參數產生液化控制點
@@ -440,8 +517,11 @@ export function pinsFor(maskPins, e) {
   if (!maskPins) return out;
   for (const p of maskPins) {
     if (p.kind === 'eye' && e.eyeEnlarge) out.push({ type: 'mag', x: p.x, y: p.y, r: p.r, s: 0.22 * e.eyeEnlarge / 100 });
-    if (p.kind === 'waist' && e.waist) out.push({ type: 'push', x: p.x, y: p.y, r: p.r, dx: p.dx * 0.09 * e.waist / 100, dy: p.dy * 0.09 * e.waist / 100 });
-    if ((p.kind === 'body' || p.kind === 'waist') && e.bodySlim) out.push({ type: 'push', x: p.x, y: p.y, r: p.r * 1.2, dx: p.dx * 0.06 * e.bodySlim / 100, dy: p.dy * 0.06 * e.bodySlim / 100 });
+    // 腰身：腰部最強（負值＝豐腰）；整體瘦身：肩到膝整段
+    if (p.kind === 'bodyProf' && (e.waist || e.bodySlim)) {
+      const w = (e.waist || 0) / 100, b = (e.bodySlim || 0) / 100;
+      out.body = { y0: p.prof.y0, y1: p.prof.y1, rows: p.prof.rows.map(([cx, hw, ww, tw]) => [cx, hw, Math.max(-0.25, Math.min(0.55, ww * w * 0.34 + tw * b * 0.2))]) };
+    }
     if (p.kind === 'jaw' && e.slim) out.push({ type: 'push', x: p.x, y: p.y, r: p.r, dx: p.dx * 0.07 * e.slim / 100, dy: p.dy * 0.07 * e.slim / 100 });
   }
   return out;

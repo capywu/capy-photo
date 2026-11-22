@@ -79,7 +79,7 @@ input[type=range]{accent-color:#e0874a}
 #splitLine b{position:absolute;top:50%;left:-15px;width:30px;height:30px;margin-top:-15px;border-radius:50%;background:#fff;color:#333;text-align:center;line-height:30px;font-weight:400}
 #splitLine span{position:absolute;top:10px;font-size:11px;background:rgba(0,0,0,.6);padding:2px 8px;border-radius:3px;white-space:nowrap}
 #splitLine .l{right:12px}#splitLine .r{left:12px}
-#cropOverlay{position:absolute;border:1px solid #fff;box-shadow:0 0 0 9999px rgba(0,0,0,.55);cursor:move}
+#cropOverlay{position:absolute;border:1.5px dashed rgba(255,255,255,.95);outline:1px dashed rgba(230,60,50,.85);outline-offset:-3px;box-shadow:0 0 0 9999px rgba(0,0,0,.55);cursor:move}
 #cropOverlay i{position:absolute;width:14px;height:14px;background:#fff;border-radius:2px}
 #cropOverlay .g{position:absolute;inset:0;background-image:linear-gradient(to right,rgba(255,255,255,.3) 1px,transparent 1px),linear-gradient(to bottom,rgba(255,255,255,.3) 1px,transparent 1px);background-size:33.33% 33.33%;pointer-events:none}
 .film{height:100px;background:#16171a;border-top:1px solid #26282d;display:flex;gap:6px;padding:10px;overflow-x:auto;overflow-y:hidden;flex:none}
@@ -124,3 +124,17 @@ input[type=range]{accent-color:#e0874a}
 .sec .t .tx{display:flex;gap:10px;align-items:center}
 .rst{cursor:pointer;color:#9aa0a8;font-size:11px;padding:1px 7px;border:1px solid #3a3d44;border-radius:10px;margin-left:8px;white-space:nowrap}.rst:hover{color:#f3b07a;border-color:#e0874a}
 .sl .rsk{cursor:pointer;color:#e0874a;font-size:12px;width:14px;text-align:center;flex:none}.sl .rsk.off{visibility:hidden}.sl .rsk:hover{color:#ffc79a}
+
+#cropOverlay .g2{position:absolute;inset:0;pointer-events:none;display:none;background-image:repeating-linear-gradient(to right,rgba(255,255,255,.55) 0 4px,transparent 4px 8px),repeating-linear-gradient(to bottom,rgba(255,255,255,.55) 0 4px,transparent 4px 8px);-webkit-mask:linear-gradient(#000,#000);background-size:100% 100%}
+#cropOverlay.rot .g{background-size:12.5% 12.5%;background-image:linear-gradient(to right,rgba(255,255,255,.45) 1px,transparent 1px),linear-gradient(to bottom,rgba(255,255,255,.45) 1px,transparent 1px)}
+
+#editSide .filmBar{position:sticky;top:-14px;z-index:5;background:#1a1b1f;padding:8px 0 8px;margin:0 0 6px;box-shadow:0 6px 8px -6px rgba(0,0,0,.6);border-bottom:1px solid #2c2e33}
+
+.layers{margin-top:8px;display:flex;flex-direction:column;gap:3px}
+.layer{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;background:#222429;cursor:pointer;font-size:12px;border:1px solid transparent}
+.layer.on{border-color:#e0874a;background:#2c2620}.layer .nm{flex:1}.layer .eye{color:#f3b07a;width:14px}.layer .cnt{color:#888;font-size:11px}.layer .x{color:#777}.layer .x:hover{color:#f66}
+#cv.brushing{cursor:none}
+#brushCur{position:absolute;border:1.5px solid rgba(255,255,255,.9);box-shadow:0 0 0 1px rgba(0,0,0,.6);border-radius:50%;pointer-events:none;z-index:6}
+#brushCur.er{border-style:dashed;border-color:#ff8080}
+
+#editSide .sl em{min-width:28px;text-align:right}

@@ -108,6 +108,11 @@ function setupIpc() {
   });
   ipcMain.handle('project:open', (_e, id) => store.loadProject(id));
 
+  ipcMain.handle('sky:pick', async (_e, kind) => {
+    const r = kind === 'lut' ? await dialog.showOpenDialog(win, { title: '選擇 LUT 檔（.cube）', properties: ['openFile'], filters: [{ name: '3D LUT', extensions: ['cube'] }] })
+      : await dialog.showOpenDialog(win, { title: kind === 'logo' ? '選擇浮水印圖片' : '選擇天空照片', properties: ['openFile'], filters: [{ name: '照片', extensions: ['jpg', 'jpeg', 'png', 'webp', 'tif', 'tiff'] }] });
+    if (r.canceled) return null; store.allowAsset(r.filePaths[0]); return r.filePaths[0];
+  });
   ipcMain.handle('import:pick', async (_e, mode) => {
     const r = await dialog.showOpenDialog(win, {
       title: '匯入照片',

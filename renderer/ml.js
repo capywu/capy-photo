@@ -45,6 +45,34 @@ export async function estimateDepth(imgData, W, H) {
   return res;
 }
 
+// ── 臉部解析（BiSeNet，CelebAMask 19 類）：回傳整張圖的頭髮機率 ──
+// box: 臉的範圍 [x0,y0,x1,y1]（像素），會放大 2.6 倍並往下移，涵蓋長髮
+export async function parseHair(imgData, W, H, box, out) {
+  const s = await session('face-parsing.onnx');
+  const fw = box[2] - box[0], fh = box[3] - box[1]; const sz = Math.max(fw, fh) * 2.6;
+  const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2 + sz * 0.12; const X0 = cx - sz / 2, Y0 = cy - sz / 2;
+  const N = 512; const c = new OffscreenCanvas(W, H); c.getContext('2d').putImageData(imgData, 0, 0);
+  const r = new OffscreenCanvas(N, N); const rx = r.getContext('2d', { willReadFrequently: true }); rx.fillStyle = '#000'; rx.fillRect(0, 0, N, N); rx.imageSmoothingQuality = 'high';
+  rx.drawImage(c, X0, Y0, sz, sz, 0, 0, N, N);
+  const d = rx.getImageData(0, 0, N, N).data; const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+  const t = new Float32Array(3 * N * N);
+  for (let i = 0; i < N * N; i++) for (let k = 0; k < 3; k++) t[k * N * N + i] = (d[i * 4 + k] / 255 - mean[k]) / std[k];
+  const res = await s.run({ input: new ort.Tensor('float32', t, [1, 3, N, N]) });
+  const o = res.output.data; const C = res.output.dims[1], oh = res.output.dims[2], ow = res.output.dims[3];
+  // softmax 取頭髮（17）機率
+  const ph = new Float32Array(ow * oh);
+  for (let i = 0; i < ow * oh; i++) { let mx = -1e9; for (let k = 0; k < C; k++) mx = Math.max(mx, o[k * ow * oh + i]); let sum = 0; for (let k = 0; k < C; k++) sum += Math.exp(o[k * ow * oh + i] - mx); ph[i] = Math.exp(o[17 * ow * oh + i] - mx) / sum; }
+  const x0 = Math.max(0, Math.floor(X0)), y0 = Math.max(0, Math.floor(Y0)), x1 = Math.min(W, Math.ceil(X0 + sz)), y1 = Math.min(H, Math.ceil(Y0 + sz));
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    const fx = (x + 0.5 - X0) / sz * ow - 0.5, fy = (y + 0.5 - Y0) / sz * oh - 0.5;
+    const a = Math.max(0, Math.min(ow - 1, Math.floor(fx))), b = Math.max(0, Math.min(oh - 1, Math.floor(fy))), a1 = Math.min(ow - 1, a + 1), b1 = Math.min(oh - 1, b + 1);
+    const ax = Math.min(1, Math.max(0, fx - a)), ay = Math.min(1, Math.max(0, fy - b));
+    const v = (ph[b * ow + a] * (1 - ax) + ph[b * ow + a1] * ax) * (1 - ay) + (ph[b1 * ow + a] * (1 - ax) + ph[b1 * ow + a1] * ax) * ay;
+    const i = y * W + x; if (v > out[i]) out[i] = v;
+  }
+  return out;
+}
+
 // ── AI 去模糊（NAFNet）：分塊處理整張來源，回傳新的來源資料 ──
 // src: { width, height, data: Uint16Array(線性 RGB) | Uint8Array(sRGB, channels) }
 export async function deblurAI(src, amount, onProgress, shouldStop) {
