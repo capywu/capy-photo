@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 const inv = (ch) => (...a) => ipcRenderer.invoke(ch, ...a);
 contextBridge.exposeInMainWorld('api', {
+  recognize: (samples) => ipcRenderer.invoke('asr:recognize', samples),
   pickSky: (kind) => ipcRenderer.invoke('sky:pick', kind),
   getState: inv('state:get'),
   createProject: inv('project:create'),

@@ -196,7 +196,17 @@ function setupIpc() {
   });
 }
 
+// ── 語音指令：離線中文語音辨識（sherpa-onnx + Paraformer，不需要網路）──
+let asrRec = null;
+function asrPath(f) { return path.join(__dirname, 'models', 'asr', f).replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep); }
+ipcMain.handle('asr:recognize', (_e, samples) => {
+  try {
+    if (!asrRec) { const sherpa = require('sherpa-onnx'); asrRec = sherpa.createOfflineRecognizer({ featConfig: { sampleRate: 16000, featureDim: 80 }, modelConfig: { paraformer: { model: asrPath('model.int8.onnx') }, tokens: asrPath('tokens.txt'), numThreads: 1, provider: 'cpu', debug: 0 } }); }
+    const st = asrRec.createStream(); st.acceptWaveform(16000, Float32Array.from(samples)); asrRec.decode(st); const r = asrRec.getResult(st); st.free && st.free(); return { text: r.text || '' };
+  } catch (err) { return { error: String(err && err.message || err) }; }
+});
 app.whenReady().then(() => {
+  try { require('electron').session.defaultSession.setPermissionRequestHandler((_wc, perm, cb) => cb(perm === 'media')); } catch {}
   store = new Store(app.getPath('userData'));
   registerProtocol();
   setupIpc();

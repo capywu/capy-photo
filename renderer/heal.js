@@ -206,6 +206,7 @@ export function applyHeals(src, ops, extra) {
   const W = src.width, H = src.height, ch = src.channels || 3;
   for (const op of ops) {
     if (op.mode === 'eyes') { if (extra?.eyeSrc?.[op.src]) applyEyes(out, op, extra.eyeSrc[op.src]); continue; }
+    if (op.mode === 'gen' && extra?.gen?.[genKey(op)]) { applyGen(out, rasterOp(op, W, H), extra.gen[genKey(op)]); continue; }
     const mask = rasterOp(op, W, H);
     if (op.mode === 'clone' || op.mode === 'heal') { cloneHeal(out, mask, W, H, op); continue; }
     if (op.mode === 'eyes') { if (extra?.eyeSrc?.[op.src]) applyEyes(out, op, extra.eyeSrc[op.src]); continue; }
@@ -255,6 +256,18 @@ function cloneHeal(out, mask0, W, H, op) {
     const a = md[(y * W + x) * 4 + 3] / 255; if (a <= 0.002) continue; const i = (y * W + x) * ch; const ci = ((y - by0) * bw + (x - bx0)) * 3;
     for (let k = 0; k < 3; k++) { let v = samp(x + ox, y + oy, k); if (corr) v += corr[ci + k]; d[i + k] = Math.max(0, Math.min(d instanceof Uint16Array ? 65535 : 255, orig[i + k] * (1 - a) + v * a)); }
   }
+}
+
+export function genKey(op) { return JSON.stringify([op.strokes || [], op.rle ? op.rle.runs.length + ':' + op.rle.runs.slice(0, 20).join(',') : '', op.seed || 0]); }
+// 生成式補圖結果（sRGB 8-bit，裁切範圍 x,y,w,h 為 0..1）貼回來源，邊緣羽化
+function applyGen(out, mask0, g) {
+  const W = out.width, H = out.height, ch = out.channels || 3, d = out.data; const lin = d instanceof Uint16Array, max = lin ? 65535 : 255;
+  const X0 = Math.floor(g.x * W), Y0 = Math.floor(g.y * H), CW = Math.max(1, Math.round(g.w * W)), CH = Math.max(1, Math.round(g.h * H));
+  const mc = new OffscreenCanvas(W, H); const mx = mc.getContext('2d', { willReadFrequently: true }); const id = mx.createImageData(W, H); for (let i = 0; i < W * H; i++) id.data[i * 4 + 3] = mask0[i] * 255; mx.putImageData(id, 0, 0);
+  const m2 = new OffscreenCanvas(W, H); const m2x = m2.getContext('2d', { willReadFrequently: true }); m2x.filter = `blur(${Math.max(1.5, Math.max(W, H) / 700)}px)`; m2x.drawImage(mc, 0, 0); const md = m2x.getImageData(0, 0, W, H).data;
+  const pc = new OffscreenCanvas(g.img.width, g.img.height); pc.getContext('2d').putImageData(g.img, 0, 0); const rc = new OffscreenCanvas(CW, CH); const rx = rc.getContext('2d', { willReadFrequently: true }); rx.imageSmoothingQuality = 'high'; rx.drawImage(pc, 0, 0, CW, CH); const pd = rx.getImageData(0, 0, CW, CH).data;
+  for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) { const X = X0 + x, Y = Y0 + y; if (X < 0 || Y < 0 || X >= W || Y >= H) continue; const a = Math.min(1, md[(Y * W + X) * 4 + 3] / 255 * 1.4); if (a <= 0.003) continue; const i = (Y * W + X) * ch, j = (y * CW + x) * 4;
+    for (let k = 0; k < 3; k++) { let v = pd[j + k] / 255; if (lin) v = Math.pow(v, 2.2); d[i + k] = Math.round(d[i + k] * (1 - a) + v * max * a); } }
 }
 
 // 閉眼修復：把另一張睜眼照片的眼睛區域，依臉部特徵點的仿射對齊貼過來，再做顏色亮度融合與羽化

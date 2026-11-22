@@ -1,7 +1,7 @@
 {
   "name": "capy-photo",
   "productName": "Capy Photo",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Capy Photo - RAW 照片管理與 AI 修圖",
   "main": "main.js",
   "author": "capywu",
@@ -14,7 +14,8 @@
   "dependencies": {
     "@vladmandic/human": "^3.3.6",
     "libraw-wasm": "^1.6.0",
-    "onnxruntime-web": "^1.31.1"
+    "onnxruntime-web": "^1.31.1",
+    "sherpa-onnx": "^2.0.3"
   },
   "devDependencies": {
     "@vladmandic/human-models": "^3.0.4",
@@ -39,7 +40,15 @@
       "!node_modules/@vladmandic/human/dist/human.js",
       "!node_modules/@vladmandic/human/src/**",
       "!node_modules/@vladmandic/human/types/**",
-      "!node_modules/libraw-wasm/dist/*.map"
+      "!node_modules/libraw-wasm/dist/*.map",
+      "!node_modules/@vladmandic/human/models/**",
+      "!node_modules/onnxruntime-web/lib/**",
+      "!node_modules/onnxruntime-web/dist/*.map",
+      "!node_modules/onnxruntime-web/dist/ort.{all,jspi,node,wasm,webgl}*",
+      "!node_modules/onnxruntime-web/dist/ort.{js,mjs,min.js,min.mjs,bundle.min.mjs}",
+      "!node_modules/onnxruntime-web/dist/ort.webgpu.{js,mjs,min.js,bundle.min.mjs}",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{asyncify,jspi}.*",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{mjs,wasm}"
     ],
     "directories": {
       "output": "dist",
@@ -71,9 +80,16 @@
         "dmg"
       ],
       "artifactName": "CapyPhoto-${version}-mac-${arch}.${ext}",
-      "identity": null
+      "identity": null,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "語音指令修圖需要使用麥克風"
+      }
     },
-    "afterPack": "build/afterPack.js"
+    "afterPack": "build/afterPack.js",
+    "asarUnpack": [
+      "models/asr/**",
+      "node_modules/sherpa-onnx/**"
+    ]
   },
   "repository": "https://github.com/capywu/capy-photo"
 }

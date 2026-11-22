@@ -141,7 +141,7 @@ export function rasterStrokes(strokes, w, h) {
 // 局部圖層（筆刷 / AI 範圍）：在完成的畫面上逐層套用局部調整
 const FS_LOCAL = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o;
-uniform int uShowM, uShowC; uniform sampler2D uF, uM1, uM2, uM3, uM4, uL0, uL1, uWt, uBase, uSkyRef, uFgRef, uSkyImg; uniform int uN, uFlip, uHasMask, uShow, uSkyType, uHasSkyImg, uHasRef;
+uniform int uShowM, uShowC, uMaskOnly; uniform sampler2D uF, uM1, uM2, uM3, uM4, uL0, uL1, uWt, uBase, uSkyRef, uFgRef, uSkyImg; uniform int uN, uFlip, uHasMask, uShow, uSkyType, uHasSkyImg, uHasRef;
 uniform highp sampler3D uLut, uFive; uniform sampler2D uLowG; uniform int uHasLut, uHasDepth, uHasFive, uHasLow; uniform float uFiveAmt, uLowAmt; uniform float uLutAmt, uAtmo, uAtmoNear, uAtmoTone, uLDepth, uScHi, uScMid, uScLo, uRays, uRaysLen, uRaysWarm; uniform vec2 uSun;
 uniform float uSkyRep, uSkyX, uSkyHor, uSkyBlend, uSkyBlur, uSkyExp, uSkyTemp, uSkyRelight, uSkyHaze, uSkyDetail, uSkyReflect, uSkyBottom, uSkyImgAsp, uTime;
 uniform vec4 uCrop; uniform float uAngle; uniform vec4 uView; uniform vec2 uSrcPx; uniform float uLensK; uniform vec4 uLP, uLP2; uniform vec3 uGeo;
@@ -296,10 +296,11 @@ void main(){
     // 銳利化（正）/ 柔化（負）
     if(P2.x > 0.) nd += (nd - lo1) * P2.x * 1.2; else if(P2.x < 0.) nd = mix(nd, lo1, -P2.x);
     float l2 = lum(nd); nd = vec3(l2) + (nd - vec3(l2)) * (1.0 + P1.x);
-    if(uP6[k].w > 0.){ vec3 tc = uP6[k].rgb; nd = mix(nd, clamp(nd * tc / max(dot(tc, vec3(0.333)), 0.05), 0., 1.), uP6[k].w * 0.7); }
+    if(uP6[k].w > 0.){ vec3 tc = uP6[k].rgb; nd = mix(nd, clamp(vec3(max(dot(nd, vec3(.299,.587,.114)), max(nd.r, max(nd.g, nd.b)) * 0.6)) * tc / max(dot(tc, vec3(0.333)), 0.05), 0., 1.), uP6[k].w * 0.85); }
     nd *= vec3(1.0 + P1.y*0.15, 1.0 - P1.z*0.1, 1.0 - P1.y*0.15 + P1.z*0.05);
     d = mix(d, clamp(nd, 0., 1.), w);
   }
+  if(uMaskOnly == 1){ o = vec4(vec3(showW), 1.); return; }
   if(uShow >= 0) d = mix(d, vec3(1.0, 0.15, 0.2), showW * 0.55);
   if(uShowM > 0){ vec4 mm = uShowM==1 ? m1 : uShowM==2 ? m2 : uShowM==3 ? m3 : m4; float sv = uShowC==0 ? mm.r : uShowC==1 ? mm.g : uShowC==2 ? mm.b : mm.a; d = mix(d, vec3(1.0, 0.12, 0.18), sv * 0.6); }
   o = vec4(d, 1.);
@@ -1120,7 +1121,7 @@ export class Engine {
       const P = this.P.local; this.draw(P, opts.fb || null, W0, H0);
       this.bind(P, 'uF', 0, F.tex); this.bind(P, 'uM1', 1, this.m1); this.bind(P, 'uM2', 2, this.m2); this.bind(P, 'uM3', 3, this.m3); this.bind(P, 'uM4', 4, this.m4);
       this.bind(P, 'uL0', 5, this.brushTex?.[0] || this.neutralTex()); this.bind(P, 'uL1', 6, this.brushTex?.[1] || this.neutralTex());
-      gl.uniform1i(P.u.uShowM, opts.showMask && this.hasMask ? +opts.showMask[2][1] : 0); gl.uniform1i(P.u.uShowC, opts.showMask ? opts.showMask[3] : 0);
+      gl.uniform1i(P.u.uMaskOnly, opts.maskOnly ? 1 : 0); gl.uniform1i(P.u.uShowM, opts.showMask && this.hasMask ? +opts.showMask[2][1] : 0); gl.uniform1i(P.u.uShowC, opts.showMask ? opts.showMask[3] : 0);
       gl.uniform1i(P.u.uN, LL.length); gl.uniform1i(P.u.uFlip, opts.fb ? 0 : 1); gl.uniform1i(P.u.uHasMask, this.hasMask ? 1 : 0);
       const all = (e.local || []); gl.uniform1i(P.u.uShow, opts.showLayer != null && opts.showLayer >= 0 ? LL.indexOf(all[opts.showLayer]) : -1);
       const c = e.crop || DEFAULT_EDITS().crop; gl.uniform4f(P.u.uCrop, c.cx, c.cy, c.w, c.h); gl.uniform1f(P.u.uAngle, (c.angle || 0) * Math.PI / 180);

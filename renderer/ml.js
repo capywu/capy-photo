@@ -93,6 +93,15 @@ export async function segPerson(imgData, W, H) {
   return res;
 }
 
+// ── 生成式 AI 補圖（MI-GAN，以 Places2 大量場景訓練）：crop 為 512×512 的 RGBA，hole 為 512×512（1＝要補的地方）──
+export async function inpaintAI(crop, hole) {
+  const s = await session('migan-inpaint.onnx'); const N = 512; const t = new Float32Array(4 * N * N);
+  for (let i = 0; i < N * N; i++) { const h = hole[i] > 0.5 ? 1 : 0; t[i] = 0.5 - h; for (let k = 0; k < 3; k++) t[(k + 1) * N * N + i] = (crop.data[i * 4 + k] / 127.5 - 1) * (1 - h); }
+  const o = (await s.run({ input: new ort.Tensor('float32', t, [1, 4, N, N]) })).output.data; const out = new ImageData(N, N);
+  for (let i = 0; i < N * N; i++) { for (let k = 0; k < 3; k++) out.data[i * 4 + k] = Math.max(0, Math.min(255, (o[k * N * N + i] * 0.5 + 0.5) * 255)); out.data[i * 4 + 3] = 255; }
+  return out;
+}
+
 // ── AI 降噪（FFDNet，KAIR 以大量真實照片訓練；sigma 控制強度）──
 export async function denoiseAI(src, sigma, onProgress, shouldStop) {
   const s = await session('ffdnet-denoise.onnx');
