@@ -14,6 +14,7 @@
     <div class="tab" data-view="edit">編輯</div>
   </div>
   <div class="spacer"></div>
+  <div class="btn" id="btnSettings" title="設定">⚙ 設定</div>
   <div class="btn" id="btnImport">＋ 匯入照片 ▾</div>
   <div class="btn p" id="btnExport">匯出</div>
 </div>
@@ -37,6 +38,7 @@
     <div class="center">
       <div class="bar" id="editBar"></div>
       <div class="viewer" id="viewer">
+        <div id="cv0wrap" class="hidden"><canvas id="cv0"></canvas><span class="lbl">修圖前</span></div>
         <canvas id="cv"></canvas>
         <img id="placeholder" class="hidden">
         <div id="cropOverlay" class="hidden"></div>

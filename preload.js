@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('api', {
   pathOf: (f) => { try { return webUtils.getPathForFile(f); } catch { return ''; } },
   updatePhotos: inv('photo:update'),
   removePhotos: inv('photo:remove'),
+  duplicatePhotos: inv('photo:duplicate'),
   reveal: inv('photo:reveal'),
   savePresets: inv('presets:save'),
   saveSettings: inv('settings:save'),

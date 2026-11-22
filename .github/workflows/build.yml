@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [macos-latest]   # Windows 攜帶版在本機打包直接給使用者，這裡只產生 Mac 版
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

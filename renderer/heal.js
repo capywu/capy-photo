@@ -200,14 +200,17 @@ function pushPullFill(out, mask, W, H) {
 function thickness(mask, W, H) { let best = 0; for (let y = 0; y < H; y += 3) { let run = 0; for (let x = 0; x < W; x++) { if (mask[y * W + x] > 0.5) { run++; if (run > best) best = run; } else run = 0; } } let bv = 0; for (let x = 0; x < W; x += 3) { let run = 0; for (let y = 0; y < H; y++) { if (mask[y * W + x] > 0.5) { run++; if (run > bv) bv = run; } else run = 0; } } return Math.min(best, bv); }
 
 // 套用所有修補 op，回傳新的來源資料（不改動原資料）
-export function applyHeals(src, ops) {
+export function applyHeals(src, ops, extra) {
   if (!ops || !ops.length) return src;
   const out = { ...src, data: src.data.slice() };
   const W = src.width, H = src.height, ch = src.channels || 3;
   for (const op of ops) {
+    if (op.mode === 'eyes') { if (extra?.eyeSrc?.[op.src]) applyEyes(out, op, extra.eyeSrc[op.src]); continue; }
     const mask = rasterOp(op, W, H);
+    if (op.mode === 'clone' || op.mode === 'heal') { cloneHeal(out, mask, W, H, op); continue; }
+    if (op.mode === 'eyes') { if (extra?.eyeSrc?.[op.src]) applyEyes(out, op, extra.eyeSrc[op.src]); continue; }
     // 電線、細線：推拉補色；一般物件：PatchMatch 複製紋理
-    if (op.rle || thickness(mask, W, H) < Math.max(10, Math.max(W, H) / 350)) { pushPullFill(out, mask, W, H); continue; }
+    if ((op.rle && !op.obj) || thickness(mask, W, H) < Math.max(10, Math.max(W, H) / 350)) { pushPullFill(out, mask, W, H); continue; }
     const sol = solveOp(out, mask); if (!sol) continue;
     const { bx0, by0, ww, wh, s, nnf, hole } = sol; const d = out.data, orig = d.slice();
     for (let y = Math.max(0, by0); y < Math.min(H, by0 + sol.bh); y++) for (let x = Math.max(0, bx0); x < Math.min(W, bx0 + sol.bw); x++) {
@@ -228,6 +231,54 @@ export function applyHeals(src, ops) {
     }
   }
   return out;
+}
+
+// 仿製印章 / 修復筆刷：從取樣點（偏移 dx,dy）複製；修復模式再用邊界差值做低頻色調融合，讓顏色亮度與周圍一致
+function cloneHeal(out, mask0, W, H, op) {
+  const ch = out.channels || 3, d = out.data, orig = d.slice(); const ox = op.dx * W, oy = op.dy * H;
+  // 羽化遮罩
+  const feather = Math.max(1, (op.strokes?.[0]?.r || 0.01) * H * (op.mode === 'clone' ? 0.35 : 0.2));
+  const mc = new OffscreenCanvas(W, H); const mx = mc.getContext('2d', { willReadFrequently: true }); const id = mx.createImageData(W, H); for (let i = 0; i < W * H; i++) { id.data[i * 4 + 3] = mask0[i] * 255; }
+  mx.putImageData(id, 0, 0); const mc2 = new OffscreenCanvas(W, H); const m2 = mc2.getContext('2d', { willReadFrequently: true }); m2.filter = `blur(${feather}px)`; m2.drawImage(mc, 0, 0); const md = m2.getImageData(0, 0, W, H).data;
+  let x0 = W, y0 = H, x1 = -1, y1 = -1; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (md[(y * W + x) * 4 + 3] > 2) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  if (x1 < 0) return;
+  const samp = (sx, sy, k) => { const X = Math.max(0, Math.min(W - 2, Math.floor(sx))), Y = Math.max(0, Math.min(H - 2, Math.floor(sy))); const fx = Math.min(1, Math.max(0, sx - X)), fy = Math.min(1, Math.max(0, sy - Y));
+    return (orig[(Y * W + X) * ch + k] * (1 - fx) + orig[(Y * W + X + 1) * ch + k] * fx) * (1 - fy) + (orig[((Y + 1) * W + X) * ch + k] * (1 - fx) + orig[((Y + 1) * W + X + 1) * ch + k] * fx) * fy; };
+  // 修復：邊界上（遮罩外一圈）的「目標 − 來源」差值，往內推拉補滿成平滑的修正圖
+  let corr = null; const pad = Math.ceil(feather * 2 + 4); const bx0 = Math.max(0, x0 - pad), by0 = Math.max(0, y0 - pad), bx1 = Math.min(W - 1, x1 + pad), by1 = Math.min(H - 1, y1 + pad); const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+  if (op.mode === 'heal') {
+    const diff = { width: bw, height: bh, channels: 3, data: new Float32Array(bw * bh * 3) }; const hole = new Float32Array(bw * bh);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) { const X = bx0 + x, Y = by0 + y; const a = md[(Y * W + X) * 4 + 3] / 255; hole[y * bw + x] = a > 0.02 ? 1 : 0; if (a <= 0.02) for (let k = 0; k < 3; k++) diff.data[(y * bw + x) * 3 + k] = orig[(Y * W + X) * ch + k] - samp(X + ox, Y + oy, k); }
+    pushPullFill(diff, hole, bw, bh); corr = diff.data;
+  }
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const a = md[(y * W + x) * 4 + 3] / 255; if (a <= 0.002) continue; const i = (y * W + x) * ch; const ci = ((y - by0) * bw + (x - bx0)) * 3;
+    for (let k = 0; k < 3; k++) { let v = samp(x + ox, y + oy, k); if (corr) v += corr[ci + k]; d[i + k] = Math.max(0, Math.min(d instanceof Uint16Array ? 65535 : 255, orig[i + k] * (1 - a) + v * a)); }
+  }
+}
+
+// 閉眼修復：把另一張睜眼照片的眼睛區域，依臉部特徵點的仿射對齊貼過來，再做顏色亮度融合與羽化
+function applyEyes(out, op, srcImg) {
+  const W = out.width, H = out.height, ch = out.channels || 3, d = out.data; const SW = srcImg.width, SH = srcImg.height, sch = srcImg.channels || 3, sd = srcImg.data;
+  const smax = sd instanceof Uint16Array ? 65535 : 255, dmax = d instanceof Uint16Array ? 65535 : 255; const slin = sd instanceof Uint16Array, dlin = d instanceof Uint16Array;
+  const toLin = (v, lin) => lin ? v : Math.pow(v, 2.2), fromLin = (v, lin) => lin ? v : Math.pow(Math.max(0, v), 1 / 2.2);
+  const sampS = (u, v, k) => { const x = u * SW - 0.5, y = v * SH - 0.5; const X = Math.max(0, Math.min(SW - 2, Math.floor(x))), Y = Math.max(0, Math.min(SH - 2, Math.floor(y))); const fx = Math.min(1, Math.max(0, x - X)), fy = Math.min(1, Math.max(0, y - Y));
+    const g = (xx, yy) => sd[(yy * SW + xx) * sch + k] / smax; return toLin((g(X, Y) * (1 - fx) + g(X + 1, Y) * fx) * (1 - fy) + (g(X, Y + 1) * (1 - fx) + g(X + 1, Y + 1) * fx) * fy, slin); };
+  for (const e of op.eyes) {
+    const A = e.A; const map = (u, v) => [A[0] * u + A[1] * v + A[2], A[3] * u + A[4] * v + A[5]];
+    const co = Math.cos(e.rot), si = Math.sin(e.rot); const rx = e.rx * W, ry = e.ry * W; const cx = e.cx * W, cy = e.cy * H; const R = Math.max(rx, ry) * 1.35;
+    const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(W - 1, Math.ceil(cx + R)), y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(H - 1, Math.ceil(cy + R));
+    // 外圈顏色比對（目標 vs 貼上來的來源），只做低頻修正
+    const sumT = [0, 0, 0], sumS = [0, 0, 0]; let n = 0;
+    const ell = (x, y) => { const dx = x - cx, dy = y - cy; const u = (co * dx + si * dy) / rx, v = (-si * dx + co * dy) / ry; return Math.hypot(u, v); };
+    for (let y = y0; y <= y1; y += 2) for (let x = x0; x <= x1; x += 2) { const r = ell(x, y); if (r < 0.95 || r > 1.25) continue; const [su, sv] = map((x + 0.5) / W, (y + 0.5) / H); for (let k = 0; k < 3; k++) { sumT[k] += toLin(d[(y * W + x) * ch + k] / dmax, dlin); sumS[k] += sampS(su, sv, k); } n++; }
+    const gain = [0, 1, 2].map(k => n && sumS[k] > 1e-4 ? Math.min(2.5, Math.max(0.4, sumT[k] / sumS[k])) : 1);
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const r = ell(x, y); const a = 1 - Math.min(1, Math.max(0, (r - 0.7) / 0.3)); if (a <= 0) continue; const w2 = a * a * (3 - 2 * a) * (e.amt ?? 1);
+      const [su, sv] = map((x + 0.5) / W, (y + 0.5) / H); const i = (y * W + x) * ch;
+      for (let k = 0; k < 3; k++) { const t = toLin(d[i + k] / dmax, dlin); const sv2 = sampS(su, sv, k) * gain[k]; d[i + k] = Math.round(Math.min(1, Math.max(0, fromLin(t * (1 - w2) + sv2 * w2, dlin))) * dmax); }
+    }
+  }
 }
 
 // 自動偵測電線 / 細線：在天空範圍找細長的暗線（黑帽運算）

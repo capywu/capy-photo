@@ -1,6 +1,6 @@
 // AI：人臉偵測、臉部網格、閉眼判斷、人像分割，以及修圖遮罩與液化控制點
 import { Human } from '../node_modules/@vladmandic/human/dist/human.esm.js';
-import { estimateDepth, parseHair } from './ml.js';
+import { estimateDepth, parseHair, segPerson } from './ml.js';
 
 let human = null, loading = null;
 export async function initAI() {
@@ -83,6 +83,13 @@ async function detectFaces(input) {
 }
 
 // 挑片分析（在預覽圖上）：人臉數、閉眼、臉部清晰度
+// 閉眼修復用：偵測臉部網格，回傳正規化座標的臉（含 468 點）與每隻眼睛的開合度
+export async function facesForEyes(bitmap) {
+  const W = bitmap.width, H = bitmap.height; const s = Math.min(1, 1600 / Math.max(W, H));
+  const c = new OffscreenCanvas(Math.round(W * s), Math.round(H * s)); c.getContext('2d').drawImage(bitmap, 0, 0, c.width, c.height);
+  const faces = await detectFaces(c);
+  return faces.filter(f => f.box[2] > c.width * 0.025).map(f => ({ box: [f.box[0] / c.width, f.box[1] / c.height, f.box[2] / c.width, f.box[3] / c.height], mesh: f.mesh.map(p => [p[0] / c.width, p[1] / c.height]), open: eyeOpenness(f.mesh) }));
+}
 export async function analyzeForCulling(bitmap) {
   const W = bitmap.width, H = bitmap.height;
   const s = Math.min(1, 1280 / Math.max(W, H));
@@ -165,6 +172,16 @@ export async function buildMasks(imgData) {
     }
   } catch (err) { console.warn('segmentation', err); }
   const gray = new Float32Array(W * H); { const d = imgData.data; for (let i = 0; i < W * H; i++) gray[i] = (0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]) / 255; }
+  // 第二個分割模型（U²-Net）：在 selfie 偵測到的人物附近採用它的結果，補回手臂、衣角、髮絲
+  if (person) { try {
+    let cov = 0; for (let i = 0; i < W * H; i++) if (person[i * 4 + 3] > 128) cov++;
+    if (cov > W * H * 0.02 || faces.length) {
+      const u2 = await segPerson(imgData, W, H);
+      const nc = new OffscreenCanvas(W, H); const nx = nc.getContext('2d', { willReadFrequently: true }); const sc0 = new OffscreenCanvas(W, H); const s0 = sc0.getContext('2d'); const id0 = s0.createImageData(W, H);
+      for (let i = 0; i < W * H; i++) { id0.data[i * 4] = id0.data[i * 4 + 1] = id0.data[i * 4 + 2] = 255; id0.data[i * 4 + 3] = person[i * 4 + 3]; } s0.putImageData(id0, 0, 0);
+      nx.filter = `blur(${Math.max(4, W / 40)}px)`; nx.drawImage(sc0, 0, 0); const near = nx.getImageData(0, 0, W, H).data;
+      for (let i = 0; i < W * H; i++) { const k = Math.min(1, near[i * 4 + 3] / 255 * 3.5); person[i * 4 + 3] = Math.max(person[i * 4 + 3] * 0.6, u2[i] * k * 255); }
+    } } catch (err) { console.warn('u2net', err); } }
   if (person) {
     const pa = new Float32Array(W * H); for (let i = 0; i < W * H; i++) pa[i] = person[i * 4 + 3] / 255;
     const q = guidedFilter(gray, pa, W, H, Math.max(3, Math.round(Math.max(W, H) / 160)), 1e-3);

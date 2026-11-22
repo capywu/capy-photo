@@ -11,7 +11,9 @@ export const DEFAULT_EDITS = () => ({
   bgBlur: 0, sky: 0,
   enhance: 0, enhanceVec: null, structure: 0, matte: 0, skinHue: 0, skinSat: 0, skinLum: 0,
   faceLight: 0, contour: 0, lips: 0, brows: 0, blush: 0, bgLight: 0, bgSat: 0, bgClean: 0,
-  atmo: 0, atmoNear: 40, atmoTone: 0, ldepth: 0, scHi: 0, scMid: 0, scLo: 0, rays: 0, raysLen: 50, raysWarm: 50, sun: null, lensDist: 0, lensCA: 0, lutPath: null, lutAmt: 100,
+  cgSh: 0, cgSs: 0, cgSl: 0, cgMh: 0, cgMs: 0, cgMl: 0, cgHh: 0, cgHs: 0, cgHl: 0, cgGh: 0, cgGs: 0, cgGl: 0, cgBlend: 50, cgBal: 0, pointColors: [],
+  lensProf: false, lensP: null, lensName: '', geoV: 0, geoH: 0, geoScale: 0,
+  aiDenoise: 0, lowLight: 0, fivekAmt: 0, fivekW: null, rosy: 0, atmo: 0, atmoNear: 40, atmoTone: 0, ldepth: 0, scHi: 0, scMid: 0, scLo: 0, rays: 0, raysLen: 50, raysWarm: 50, sun: null, lensDist: 0, lensCA: 0, lutPath: null, lutAmt: 100,
   skyRep: 0, skyType: 'blue', skyX: 0, skyHorizon: 0, skyBlend: 20, skyBlur: 0, skyExp: 0, skyTemp: 0, skyRelight: 40, skyHaze: 0, skyDetail: 50, skyReflect: 0, skyImg: null, fog: 0, dust: 0, cm: null, cmAmt: 0,
   hairAmt: 0, hairColor: 'brown', hairLum: 0, waist: 0, bodySlim: 0, water: 0, waterColor: 0,
   mist: 0, mistSize: 50, mistSoft: 40, mistWarm: true,
@@ -40,20 +42,24 @@ void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`;
 const WARP = `
 uniform int uPins; uniform vec4 uPinA[48]; uniform vec4 uPinB[48]; uniform vec2 uAspect;
 uniform int uBodyN; uniform vec2 uBodyY; uniform vec4 uBody[48];
+// 該列的身形資料：x＝中心、y＝半寬、z＝強度、w＝是否有效
+vec4 bodyRow(float y){
+  if(uBodyN <= 0) return vec4(0.);
+  float t = (y - uBodyY.x) / (uBodyY.y - uBodyY.x) * float(uBodyN) - 0.5;
+  if(t <= -1.0 || t >= float(uBodyN)) return vec4(0.);
+  int i0 = int(clamp(floor(t), 0., float(uBodyN-1))); int i1 = min(i0 + 1, uBodyN - 1);
+  vec4 r = mix(uBody[i0], uBody[i1], clamp(t - floor(t), 0., 1.));
+  r.z *= clamp(min(t + 1.0, float(uBodyN) - t), 0., 1.); r.w = 1.0; return r;
+}
 vec2 warpUV(vec2 uv){
   vec2 q = uv;
-  // 身形：依人物輪廓逐列把軀幹往中心線收（腰身＋整體瘦身），外側背景自然補上
-  if(uBodyN > 0){
-    float t = (uv.y - uBodyY.x) / (uBodyY.y - uBodyY.x) * float(uBodyN) - 0.5;
-    if(t > -1.0 && t < float(uBodyN)){
-      int i0 = int(clamp(floor(t), 0., float(uBodyN-1))); int i1 = min(i0 + 1, uBodyN - 1);
-      vec4 r = mix(uBody[i0], uBody[i1], clamp(t - floor(t), 0., 1.));
-      float edgeFade = clamp(min(t + 1.0, float(uBodyN) - t), 0., 1.);
-      float k = r.z * edgeFade; float R = max(r.y, 0.004) * 1.75;
-      float dd = uv.x - r.x; float u = abs(dd) / R;
-      if(u < 1.0 && k != 0.){ float g = 1.0 - smoothstep(0.3, 1.0, u); q.x = r.x + dd * (1.0 + k * g); }
-    }
-  }
+  // 身形：依人物輪廓逐列把軀幹往中心線收（腰身＋整體瘦身）
+  vec4 br = bodyRow(uv.y);
+  // 軀幹內線性收窄；軀幹外（手臂）整段平移，平移量往外平滑歸零（背景由合成保留原位）
+  if(br.w > 0. && br.z != 0.){ float hw = max(br.y, 0.004); float sft = clamp(br.z, -0.3, 0.45) * hw * 0.6; float dd = uv.x - br.x; float ad = abs(dd);
+    float inner = hw - sft; float D = max(hw * 1.3, abs(sft) * 2.5); float ds;
+    if(ad < inner) ds = ad * hw / inner; else ds = ad + sft * (1.0 - smoothstep(hw * 2.0, hw * 3.1, ad));
+    q.x = br.x + sign(dd) * ds; }
   for(int i=0;i<48;i++){ if(i>=uPins) break;
     vec4 a = uPinA[i]; vec4 b = uPinB[i];
     vec2 d = (uv - a.xy) * uAspect; float r = a.z; float dist = length(d);
@@ -72,13 +78,35 @@ const FS_BASE = `#version 300 es
 precision highp float; precision highp usampler2D;
 in vec2 uv; out vec4 o;
 uniform usampler2D uSrc; uniform vec2 uSrcSize; uniform vec3 uMul; uniform float uScale; uniform int uIsSRGB;
+uniform sampler2D uPM; uniform int uHasPM;
 ${WARP}
 vec3 fetch(ivec2 p){ p = clamp(p, ivec2(0), ivec2(uSrcSize)-1); vec3 c = vec3(texelFetch(uSrc, p, 0).rgb) * uScale;
   if(uIsSRGB==1) c = mix(c/12.92, pow((c+0.055)/1.055, vec3(2.4)), step(0.04045, c)); return c; }
+vec3 samp(vec2 u){ vec2 q = u * uSrcSize - 0.5; ivec2 i0 = ivec2(floor(q)); vec2 f = fract(q);
+  return mix(mix(fetch(i0), fetch(i0+ivec2(1,0)), f.x), mix(fetch(i0+ivec2(0,1)), fetch(i0+ivec2(1,1)), f.x), f.y); }
 void main(){
-  vec2 q = warpUV(uv) * uSrcSize - 0.5;
-  ivec2 i0 = ivec2(floor(q)); vec2 f = fract(q);
-  vec3 c = mix(mix(fetch(i0), fetch(i0+ivec2(1,0)), f.x), mix(fetch(i0+ivec2(0,1)), fetch(i0+ivec2(1,1)), f.x), f.y);
+  vec2 wq = warpUV(uv);
+  vec3 c = samp(wq);
+  // 身形調整只移動人物：背景維持原位，人物收窄後露出的地方用身體邊緣外側的背景鏡射補上
+  vec4 br = bodyRow(uv.y);
+  if(uHasPM == 1 && br.w > 0. && br.z != 0. && abs(uv.x - br.x) < br.y * 3.2){
+    float aNew = smoothstep(0.45, 0.75, texture(uPM, wq).r);
+    // 原本人物範圍用「擴張後」的遮罩，連遮罩邊緣沒抓滿的手臂、髮絲也一起換成背景，避免殘影
+    float dl = 0.012; float mo = texture(uPM, uv).r; for(int k = 1; k <= 4; k++){ float o2 = dl * float(k) / 4.0; mo = max(mo, max(texture(uPM, uv + vec2(o2, 0.)).r, texture(uPM, uv - vec2(o2, 0.)).r) * (1.0 - float(k) * 0.08)); }
+    float aOld = smoothstep(0.2, 0.5, mo);
+    vec3 bg = samp(uv);
+    if(aOld > 0.01){
+      float sgn = uv.x >= br.x ? 1.0 : -1.0; float st = 1.5 / uSrcSize.x * max(1.0, uSrcSize.x / 800.0); float e = uv.x;
+      for(int k = 0; k < 160; k++){ e += sgn * st; if(texture(uPM, vec2(e, uv.y)).r < 0.12 || e < 0. || e > 1.) break; } e += sgn * 0.012;
+      float m = clamp(e + (e - uv.x) + sgn * st * 2.0, 0., 1.);
+      // 鏡射點如果落在手臂等人物上，繼續往外找下一段背景
+      if(texture(uPM, vec2(m, uv.y)).r > 0.3){ float m2 = m; for(int k = 0; k < 120; k++){ m2 += sgn * st; if(m2 < 0. || m2 > 1. || texture(uPM, vec2(m2, uv.y)).r < 0.2) break; } m = clamp(m2 + sgn * st * 3.0 + (m - e) * 0.5, 0., 1.); }
+      bg = mix(bg, samp(vec2(m, uv.y)), aOld);
+    }
+    // 遮罩不確定的地方（手臂貼著身體、顏色接近背景）不做合成，改用一般液化，避免撕裂與殘影
+    float m1v = texture(uPM, uv).r, m2v = texture(uPM, wq).r; float conf = min(abs(m1v * 2.0 - 1.0), abs(m2v * 2.0 - 1.0));
+    c = mix(c, mix(bg, c, aNew), smoothstep(0.45, 0.85, conf));
+  }
   o = vec4(c * uMul, 1.0);
 }`;
 
@@ -86,6 +114,12 @@ const FS_COPY = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uTex;
 void main(){ o = texture(uTex, uv); }`;
 
+// 透視校正參數：自動放大到四角都在照片內（不出現黑邊）
+function geoU(e) {
+  const gx = -(e.geoV || 0) / 100 * 0.6, gy = -(e.geoH || 0) / 100 * 0.6; let z = 1;
+  for (const [x, y] of [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]) { const den = Math.max(0.2, 1 + gx * y * 1.6 + gy * x * 1.6); z = Math.max(z, 1 / den); }
+  return [gx, gy, (1 + (e.geoScale || 0) / 100) * z];
+}
 // 筆畫轉點陣（灰階，128＝不變，筆刷往 255、橡皮擦往 0）
 const _rc = {};
 export function rasterStrokes(strokes, w, h) {
@@ -107,11 +141,11 @@ export function rasterStrokes(strokes, w, h) {
 // 局部圖層（筆刷 / AI 範圍）：在完成的畫面上逐層套用局部調整
 const FS_LOCAL = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o;
-uniform sampler2D uF, uM1, uM2, uM3, uM4, uL0, uL1, uWt, uBase, uSkyRef, uFgRef, uSkyImg; uniform int uN, uFlip, uHasMask, uShow, uSkyType, uHasSkyImg, uHasRef;
-uniform highp sampler3D uLut; uniform int uHasLut, uHasDepth; uniform float uLutAmt, uAtmo, uAtmoNear, uAtmoTone, uLDepth, uScHi, uScMid, uScLo, uRays, uRaysLen, uRaysWarm; uniform vec2 uSun;
+uniform int uShowM, uShowC; uniform sampler2D uF, uM1, uM2, uM3, uM4, uL0, uL1, uWt, uBase, uSkyRef, uFgRef, uSkyImg; uniform int uN, uFlip, uHasMask, uShow, uSkyType, uHasSkyImg, uHasRef;
+uniform highp sampler3D uLut, uFive; uniform sampler2D uLowG; uniform int uHasLut, uHasDepth, uHasFive, uHasLow; uniform float uFiveAmt, uLowAmt; uniform float uLutAmt, uAtmo, uAtmoNear, uAtmoTone, uLDepth, uScHi, uScMid, uScLo, uRays, uRaysLen, uRaysWarm; uniform vec2 uSun;
 uniform float uSkyRep, uSkyX, uSkyHor, uSkyBlend, uSkyBlur, uSkyExp, uSkyTemp, uSkyRelight, uSkyHaze, uSkyDetail, uSkyReflect, uSkyBottom, uSkyImgAsp, uTime;
-uniform vec4 uCrop; uniform float uAngle; uniform vec4 uView; uniform vec2 uSrcPx; uniform float uLensK;
-uniform vec4 uP0[8]; uniform vec4 uP1[8]; uniform vec4 uP2[8]; uniform vec4 uP3[8];
+uniform vec4 uCrop; uniform float uAngle; uniform vec4 uView; uniform vec2 uSrcPx; uniform float uLensK; uniform vec4 uLP, uLP2; uniform vec3 uGeo;
+uniform vec4 uP0[8]; uniform vec4 uP1[8]; uniform vec4 uP2[8]; uniform vec4 uP3[8]; uniform vec4 uP4[8]; uniform vec4 uP5[8]; uniform vec4 uP6[8];
 ${WARP}
 float lum(vec3 c){ return dot(c, vec3(0.2126,0.7152,0.0722)); }
 vec3 rgb2hsv(vec3 c){ vec4 K=vec4(0.,-1./3.,2./3.,-1.); vec4 p=mix(vec4(c.bg,K.wz),vec4(c.gb,K.xy),step(c.b,c.g)); vec4 q=mix(vec4(p.xyw,c.r),vec4(c.r,p.yzx),step(p.x,c.r)); float d=q.x-min(q.w,q.y); float e=1e-10; return vec3(abs(q.z+(q.w-q.y)/(6.*d+e)),d/(q.x+e),q.x); }
@@ -162,7 +196,11 @@ vec2 outToSrc(vec2 ou){
   vec2 q = uView.xy + (ou - 0.5) * uView.zw; vec2 cropPx = uCrop.zw * uSrcPx;
   vec2 p = (uCrop.xy - 0.5) * uSrcPx + (q - 0.5) * cropPx; float s = sin(uAngle), co = cos(uAngle);
   p = vec2(co*p.x - s*p.y, s*p.x + co*p.y); vec2 r0 = (0.5 * uSrcPx + p) / uSrcPx;
+  if(uGeo.x != 0. || uGeo.y != 0. || uGeo.z != 1.0){ vec2 pp = (r0 - 0.5) / uGeo.z; float den = 1.0 + uGeo.x * pp.y * 1.6 + uGeo.y * pp.x * 1.6; pp /= max(den, 0.2); r0 = 0.5 + pp; }
   if(uLensK != 0.){ vec2 dd = (r0 - 0.5) * vec2(uSrcPx.x / uSrcPx.y, 1.0); float r2 = dot(dd, dd) / (0.25 * (uSrcPx.x*uSrcPx.x/(uSrcPx.y*uSrcPx.y)) + 0.25); r0 = 0.5 + (r0 - 0.5) * (1.0 + uLensK * r2) / (1.0 + max(uLensK, 0.)); }
+  if(uLP.x > 0.5){ vec2 pp = (r0 - 0.5) * uSrcPx / (0.5 * min(uSrcPx.x, uSrcPx.y)) * uLP2.z; float ru = length(pp); float rd = ru;
+    if(uLP.x < 1.5) rd = ru * (1.0 - uLP2.x + uLP2.x * ru * ru); else if(uLP.x < 2.5) rd = ru * (1.0 + uLP2.x * ru * ru + uLP2.y * ru * ru * ru * ru); else rd = ru * (uLP.y * ru * ru * ru + uLP.z * ru * ru + uLP.w * ru + 1.0 - uLP.y - uLP.z - uLP.w);
+    float k = ru > 1e-5 ? rd / ru : 1.0; r0 = 0.5 + (r0 - 0.5) * k / uLP2.w; }
   return r0;
 }
 void main(){
@@ -215,6 +253,10 @@ void main(){
     float L = lum(d); float wh = smoothstep(0.5, 0.85, L), wl = 1.0 - smoothstep(0.15, 0.45, L), wm = clamp(1.0 - wh - wl, 0., 1.);
     float k = uScHi * wh + uScMid * wm + uScLo * wl; d = clamp(d + (d - lo2) * k * 0.9 + (L - 0.5) * k * 0.15 * vec3(1.0), 0., 1.);
   }
+  // ── AI 暗部提亮（Zero-DCE 增益圖，暗處提得多、亮處幾乎不動）──
+  if(uHasLow == 1 && uLowAmt > 0.){ float gn = 1.0 + texture(uLowG, su).r * 3.0; float L0 = lum(d); vec3 dl = d * mix(1.0, gn, uLowAmt); float L1 = lum(dl); d = clamp(mix(dl, dl * (0.92 + 0.08 * L0 / max(L1, 0.01)), 0.5), 0., 1.); }
+  // ── AI 專業調色（FiveK 自適應 3D LUT）──
+  if(uHasFive == 1 && uFiveAmt > 0.){ d = mix(d, texture(uFive, clamp(d, 0., 1.)).rgb, uFiveAmt); }
   // ── 3D LUT（.cube 色彩風格檔）──
   if(uHasLut == 1 && uLutAmt > 0.){ d = mix(d, texture(uLut, clamp(d, 0., 1.)).rgb, uLutAmt); }
   // ── 陽光光束（Sunrays）：從太陽位置沿射線累積亮部，被樹葉、建築遮住的地方自然形成光束 ──
@@ -236,6 +278,8 @@ void main(){
     if(mt==1) ai = m2.r; else if(mt==2) ai = 1.0 - m2.r; else if(mt==3) ai = m2.g; else if(mt==4) ai = m1.r; else if(mt==5) ai = m4.r; else if(mt==6) ai = m4.g; else if(mt==8) ai = m3.b;
     else if(mt==7){ vec3 hv = rgb2hsv(d); ai = (1.0 - smoothstep(0.06,0.1,abs(hv.x-0.27))) * smoothstep(0.12,0.3,hv.y) * (1.0 - m2.r); }
     else if(mt==9) ai = 1.0;
+    else if(mt==10){ vec2 p0 = uP4[k].xy * uSrcPx, p1 = uP4[k].zw * uSrcPx; vec2 dv = p1 - p0; float tt = dot(su * uSrcPx - p0, dv) / max(dot(dv, dv), 1.0); ai = 1.0 - smoothstep(0., 1., tt); }
+    else if(mt==11){ vec2 v = su * uSrcPx - uP4[k].xy * uSrcPx; float ro = uP5[k].y; v = vec2(cos(ro)*v.x + sin(ro)*v.y, -sin(ro)*v.x + cos(ro)*v.y); vec2 rr = max(uP4[k].zw * uSrcPx, vec2(2.)); float dd2 = length(v / rr); float fe = clamp(uP5[k].x, 0.01, 1.0); ai = 1.0 - smoothstep(1.0 - fe, 1.0, dd2); }
     float bv = k==0?b0.r: k==1?b0.g: k==2?b0.b: k==3?b0.a: k==4?b1.r: k==5?b1.g: k==6?b1.b: b1.a;
     float w = clamp(ai + (bv - 0.502) * 2.0, 0., 1.);
     if(P3.y > 0.5) w = 1.0 - w;
@@ -252,10 +296,12 @@ void main(){
     // 銳利化（正）/ 柔化（負）
     if(P2.x > 0.) nd += (nd - lo1) * P2.x * 1.2; else if(P2.x < 0.) nd = mix(nd, lo1, -P2.x);
     float l2 = lum(nd); nd = vec3(l2) + (nd - vec3(l2)) * (1.0 + P1.x);
+    if(uP6[k].w > 0.){ vec3 tc = uP6[k].rgb; nd = mix(nd, clamp(nd * tc / max(dot(tc, vec3(0.333)), 0.05), 0., 1.), uP6[k].w * 0.7); }
     nd *= vec3(1.0 + P1.y*0.15, 1.0 - P1.z*0.1, 1.0 - P1.y*0.15 + P1.z*0.05);
     d = mix(d, clamp(nd, 0., 1.), w);
   }
   if(uShow >= 0) d = mix(d, vec3(1.0, 0.15, 0.2), showW * 0.55);
+  if(uShowM > 0){ vec4 mm = uShowM==1 ? m1 : uShowM==2 ? m2 : uShowM==3 ? m3 : m4; float sv = uShowC==0 ? mm.r : uShowC==1 ? mm.g : uShowC==2 ? mm.b : mm.a; d = mix(d, vec3(1.0, 0.12, 0.18), sv * 0.6); }
   o = vec4(d, 1.);
 }`;
 
@@ -363,12 +409,13 @@ uniform float uSharpen, uDenoise, uColorNoise, uVignette, uGrain, uBW;
 uniform float uSmooth, uBlemish, uDark, uTeeth, uEyes, uSubject, uSkinEven, uBgBlur, uSky;
 uniform float uHslH[8], uHslS[8], uHslL[8];
 uniform vec3 uSkinRef; uniform float uSpotR; uniform sampler2D uSPB, uBL, uM3; uniform int uHasBL; uniform int uHasSpot;
-uniform float uStructure, uMatte, uSkinHue, uSkinSat, uSkinLum, uFaceLight, uContour, uLips, uBrows, uBlush, uBgLight, uBgSat, uBgClean, uSkyRep, uFog, uDust, uCmAmt, uSkyBottom;
+uniform float uRosy; uniform float uStructure, uMatte, uSkinHue, uSkinSat, uSkinLum, uFaceLight, uContour, uLips, uBrows, uBlush, uBgLight, uBgSat, uBgClean, uSkyRep, uFog, uDust, uCmAmt, uSkyBottom;
 uniform int uSkyType; uniform vec3 uCmS, uCmO;
 uniform sampler2D uM4; uniform float uHal; uniform float uHairAmt, uHairLum, uWater, uWaterCol, uGlow, uStar, uTwilight, uBgRep; uniform float uHairRefL; uniform vec3 uHairCol, uBgCol, uBgCol2; uniform int uAlphaOut;
 uniform int uLocN; uniform ivec4 uLocM; uniform vec4 uLocA[4];
 uniform float uMist, uMistSize, uMistSoft, uMistWarm;
 uniform float uFocusAmt, uFocusRange, uFocusD; uniform int uHasDepth;
+uniform vec4 uCg[4]; uniform float uCgBlend, uCgBal; uniform int uPCN; uniform vec4 uPC[4]; uniform float uPCL[4];
 uniform vec3 uGradeS, uGradeH; uniform float uGradeBal, uChrome, uChromeBlue, uBleach; uniform vec3 uBwW, uBwTone;
 float hash2(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
 float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(hash2(i),hash2(i+vec2(1,0)),f.x), mix(hash2(i+vec2(0,1)),hash2(i+vec2(1,1)),f.x), f.y); }
@@ -404,7 +451,7 @@ vec3 rgb2hsv(vec3 c){ vec4 K=vec4(0.,-1./3.,2./3.,-1.); vec4 p=mix(vec4(c.bg,K.w
 vec3 hsv2rgb(vec3 c){ vec3 p=abs(fract(c.xxx+vec3(1.,2./3.,1./3.))*6.-3.); return c.z*mix(vec3(1.),clamp(p-1.,0.,1.),c.y); }
 float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }
 
-uniform float uLensK, uLensCA;
+uniform float uLensK, uLensCA; uniform vec3 uGeo; uniform vec4 uLP, uLP2, uLV; uniform vec2 uLT;
 vec2 outToSrc(vec2 ou){
   // ou: 0..1 輸出畫面 → 裁切區座標 → 來源 uv
   vec2 q = uView.xy + (ou - 0.5) * uView.zw;              // 裁切區內 0..1（含縮放/平移）
@@ -414,7 +461,11 @@ vec2 outToSrc(vec2 ou){
   float s = sin(uAngle), co = cos(uAngle);
   p = vec2(co*p.x - s*p.y, s*p.x + co*p.y);
   vec2 r0 = (0.5 * uSrcPx + p) / uSrcPx;
+  if(uGeo.x != 0. || uGeo.y != 0. || uGeo.z != 1.0){ vec2 pp = (r0 - 0.5) / uGeo.z; float den = 1.0 + uGeo.x * pp.y * 1.6 + uGeo.y * pp.x * 1.6; pp /= max(den, 0.2); r0 = 0.5 + pp; }
   if(uLensK != 0.){ vec2 dd = (r0 - 0.5) * vec2(uSrcPx.x / uSrcPx.y, 1.0); float r2 = dot(dd, dd) / (0.25 * (uSrcPx.x*uSrcPx.x/(uSrcPx.y*uSrcPx.y)) + 0.25); r0 = 0.5 + (r0 - 0.5) * (1.0 + uLensK * r2) / (1.0 + max(uLensK, 0.)); }
+  if(uLP.x > 0.5){ vec2 pp = (r0 - 0.5) * uSrcPx / (0.5 * min(uSrcPx.x, uSrcPx.y)) * uLP2.z; float ru = length(pp); float rd = ru;
+    if(uLP.x < 1.5) rd = ru * (1.0 - uLP2.x + uLP2.x * ru * ru); else if(uLP.x < 2.5) rd = ru * (1.0 + uLP2.x * ru * ru + uLP2.y * ru * ru * ru * ru); else rd = ru * (uLP.y * ru * ru * ru + uLP.z * ru * ru + uLP.w * ru + 1.0 - uLP.y - uLP.z - uLP.w);
+    float k = ru > 1e-5 ? rd / ru : 1.0; r0 = 0.5 + (r0 - 0.5) * k / uLP2.w; }
   return r0;
 }
 
@@ -428,6 +479,8 @@ void main(){
   }
   vec3 c = texture(uW, su).rgb;
   if(uLensCA != 0.){ c.r = texture(uW, 0.5 + (su - 0.5) * (1.0 - uLensCA)).r; c.b = texture(uW, 0.5 + (su - 0.5) * (1.0 + uLensCA)).b; }
+  if(uLT.x != 1.0 || uLT.y != 1.0){ c.r = texture(uW, 0.5 + (su - 0.5) * uLT.x).r; c.b = texture(uW, 0.5 + (su - 0.5) * uLT.y).b; }
+  if(uLV.w > 0.5){ vec2 pp = (su - 0.5) * uSrcPx / (0.5 * min(uSrcPx.x, uSrcPx.y)) * uLP2.z; float r2 = dot(pp, pp); c /= max(0.2, 1.0 + uLV.x * r2 + uLV.y * r2 * r2 + uLV.z * r2 * r2 * r2); }
   vec3 b1 = texture(uB1, su).rgb, b2 = texture(uB2, su).rgb, b3 = texture(uB3, su).rgb, b4 = texture(uB4, su).rgb, bs = texture(uBS, su).rgb;
   vec4 m1 = vec4(0.), m2 = vec4(0.);
   vec4 m3 = vec4(0.), m4 = vec4(0.);
@@ -589,6 +642,13 @@ void main(){
     vec3 h2 = rgb2hsv(d); h2.x = fract(h2.x + uSkinHue*0.03 + 1.0); h2.y = clamp(h2.y*(1.0+uSkinSat*0.6),0.,1.); h2.z = clamp(h2.z*(1.0+uSkinLum*0.25),0.,1.);
     d = mix(d, hsv2rgb(h2), skin);
   }
+  // 紅潤：皮膚往粉紅偏、臉頰（腮紅區）多一點，保持亮度不變（白裡透紅）
+  if(skin > 0.002 && uRosy > 0.){
+    float L0 = lum(d); vec3 pink = vec3(1.0, 0.80, 0.80); float w2 = skin * uRosy * (0.45 + 0.9 * m3.a + 0.25 * m3.b);
+    vec3 nd = d * mix(vec3(1.0), pink / lum(pink) , 0.35 * w2); nd *= L0 / max(lum(nd), 1e-3);
+    vec3 hh = rgb2hsv(nd); float hd = mod(hh.x - 0.985 + 0.5, 1.0) - 0.5; hh.x = fract(hh.x - hd * 0.18 * w2 + 1.0); nd = hsv2rgb(hh);
+    d = mix(d, clamp(nd, 0., 1.), min(1.0, w2 * 1.4));
+  }
   // 唇色
   if(m3.r > 0.002 && uLips != 0.){ vec3 h2 = rgb2hsv(d); float hd = mod(h2.x + 0.5, 1.0) - 0.5; h2.x = fract(h2.x - hd*0.4*max(uLips,0.) + 1.0); h2.y = clamp(h2.y*(1.0+uLips*0.7),0.,1.); h2.z = clamp(h2.z*(1.0 - max(uLips,0.)*0.06),0.,1.); d = mix(d, hsv2rgb(h2), m3.r); }
   // 腮紅
@@ -707,6 +767,19 @@ void main(){
     d = mix(vec3(l7), d, 1.0) + (l7 - lum(d));   // 保持亮度
     d = clamp(d, 0., 1.);
   }
+  // 色彩分級（色輪）：暗部、中間調、亮部、整體，各自的色相、飽和、明度
+  if(uCg[0].y + uCg[1].y + uCg[2].y + uCg[3].y > 0. || abs(uCg[0].z) + abs(uCg[1].z) + abs(uCg[2].z) + abs(uCg[3].z) > 0.){
+    float L = lum(d); float bl = 0.12 + uCgBlend * 0.35; float b2 = uCgBal * 0.25;
+    float ws = 1.0 - smoothstep(0.33 + b2 - bl, 0.33 + b2 + bl, L), wh = smoothstep(0.66 + b2 - bl, 0.66 + b2 + bl, L), wm = clamp(1.0 - ws - wh, 0., 1.);
+    float W4[4] = float[4](ws, wm, wh, 1.0); vec3 add = vec3(0.); float lm = 0.;
+    for(int i = 0; i < 4; i++){ add += (hsv2rgb(vec3(uCg[i].x, 1.0, 1.0)) - 0.5) * uCg[i].y * 0.3 * W4[i]; lm += uCg[i].z * 0.35 * W4[i]; }
+    d += add; d += (L - lum(d)); d = clamp(d * (1.0 + lm), 0., 1.);
+  }
+  // 點顏色：選一個顏色，只調整接近它的色相（可設定範圍）
+  for(int i = 0; i < 4; i++){ if(i >= uPCN) break;
+    vec3 hv = rgb2hsv(d); float dh = abs(mod(hv.x - uPC[i].x + 0.5, 1.0) - 0.5); float w = (1.0 - smoothstep(uPC[i].y * 0.6, uPC[i].y, dh)) * smoothstep(0.04, 0.16, hv.y);
+    if(w < 0.002) continue; hv.x = fract(hv.x + uPC[i].z * 0.08 * w + 1.0); hv.y = clamp(hv.y * (1.0 + uPC[i].w * w), 0., 1.); hv.z = clamp(hv.z * (1.0 + uPCL[i] * 0.5 * w), 0., 1.); d = hsv2rgb(hv);
+  }
   // 色調曲線
   d = curveF(d);
   if(uBW > 0.5){ d = vec3(dot(d, uBwW)); if(uBwTone.z > 0.){ vec3 tc = hsv2rgb(vec3(uBwTone.x, 1.0, 1.0)); float l8 = d.r; d = mix(d, l8 * (tc / max(lum(tc),1e-3)), uBwTone.z * 0.5 * (1.0 - abs(l8 - 0.5)*1.2)); d = clamp(d,0.,1.); } }
@@ -824,6 +897,14 @@ export class Engine {
     const px = pt.x * W - W / 2, py = pt.y * H - H / 2; const rx = Math.cos(a) * px - Math.sin(a) * py, ry = Math.sin(a) * px + Math.cos(a) * py;
     const qx = (rx - (c.cx - 0.5) * W) / (c.w * W) + 0.5, qy = (ry - (c.cy - 0.5) * H) / (c.h * H) + 0.5;
     return [(qx - v[0]) / v[2] + 0.5, (qy - v[1]) / v[3] + 0.5];
+  }
+  setLowGain(g) { const gl = this.gl; if (this.lowGainTex) gl.deleteTexture(this.lowGainTex); this.lowGainTex = g ? this.texRGBA8(g.w, g.h, g.data) : null; }
+  // FiveK：三個基底 LUT 依權重混合成一個 33³ 的 3D 貼圖
+  ensureFivek(w) {
+    const key = w.map(v => v.toFixed(4)).join(','); if (key === this.fiveKey) return; this.fiveKey = key;
+    this.onNeedFive && this.onNeedFive(w, (data) => { if (this.fiveKey !== key) return; const gl = this.gl; if (this.fiveTex) gl.deleteTexture(this.fiveTex); const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, t); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 33, 33, 33, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+      for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_3D, k, v);
+      this.fiveTex = t; this.onSkyLoaded && this.onSkyLoaded(); });
   }
   emptyLut() { if (!this._elut) { const gl = this.gl; const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, t); gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4)); this._elut = t; } return this._elut; }
   // 讀取 .cube 3D LUT
@@ -944,9 +1025,11 @@ export class Engine {
     const mul = [ev * (1 + 0.35 * t) * (1 + 0.1 * ti), ev * (1 - 0.22 * ti), ev * (1 - 0.35 * t) * (1 + 0.1 * ti)];
     const P = this.P.base;
     const w0 = this.target('W', W, H);
-    this.draw(P, w0.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, mul); this.warpUniforms(P); this.quad();
+    this.draw(P, w0.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, mul); this.warpUniforms(P);
+    this.bind(P, 'uPM', 1, this.hasMask ? this.m2 : this.emptyMask); gl.uniform1i(P.u.uHasPM, this.hasMask && this.body ? 1 : 0); this.quad();
+    this.origDirty = true;
     if (this.origDirty) {
-      const o = this.target('O', W, H); this.draw(P, o.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, [1, 1, 1]); gl.uniform1i(P.u.uPins, 0); gl.uniform1i(P.u.uBodyN, 0); this.quad();
+      const o = this.target('O', W, H); this.draw(P, o.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, [1, 1, 1]); gl.uniform1i(P.u.uPins, 0); gl.uniform1i(P.u.uBodyN, 0); gl.uniform1i(P.u.uHasPM, 0); this.quad();
       this.origDirty = false;
     }
     if (e.defocus > 0) {
@@ -1027,8 +1110,8 @@ export class Engine {
     const gl = this.gl;
     const LL = (e.local || []).filter(l => l.on !== false).slice(0, 8);
     const wantSky = e.skyRep > 0 && this.hasMask && this.skyRefTex;
-    const wantFx = e.atmo > 0 || e.ldepth || e.scHi || e.scMid || e.scLo || e.rays > 0 || (e.lutPath && e.lutAmt > 0);
-    if ((LL.length || wantSky || wantFx || (opts.showLayer ?? -1) >= 0) && !opts._inner) {
+    const wantFx = (e.lowLight > 0 && this.lowGainTex) || (e.fivekAmt > 0 && e.fivekW) || e.atmo > 0 || e.ldepth || e.scHi || e.scMid || e.scLo || e.rays > 0 || (e.lutPath && e.lutAmt > 0);
+    if ((LL.length || wantSky || wantFx || (opts.showLayer ?? -1) >= 0 || opts.showMask) && !opts._inner && !opts.noPost) {
       const W0 = opts.width || this.canvas.width, H0 = opts.height || this.canvas.height;
       const F = this.fin8(W0, H0);
       this.ensureBrush(LL, this.liveBrush); this.neutralTex();
@@ -1037,15 +1120,19 @@ export class Engine {
       const P = this.P.local; this.draw(P, opts.fb || null, W0, H0);
       this.bind(P, 'uF', 0, F.tex); this.bind(P, 'uM1', 1, this.m1); this.bind(P, 'uM2', 2, this.m2); this.bind(P, 'uM3', 3, this.m3); this.bind(P, 'uM4', 4, this.m4);
       this.bind(P, 'uL0', 5, this.brushTex?.[0] || this.neutralTex()); this.bind(P, 'uL1', 6, this.brushTex?.[1] || this.neutralTex());
+      gl.uniform1i(P.u.uShowM, opts.showMask && this.hasMask ? +opts.showMask[2][1] : 0); gl.uniform1i(P.u.uShowC, opts.showMask ? opts.showMask[3] : 0);
       gl.uniform1i(P.u.uN, LL.length); gl.uniform1i(P.u.uFlip, opts.fb ? 0 : 1); gl.uniform1i(P.u.uHasMask, this.hasMask ? 1 : 0);
       const all = (e.local || []); gl.uniform1i(P.u.uShow, opts.showLayer != null && opts.showLayer >= 0 ? LL.indexOf(all[opts.showLayer]) : -1);
       const c = e.crop || DEFAULT_EDITS().crop; gl.uniform4f(P.u.uCrop, c.cx, c.cy, c.w, c.h); gl.uniform1f(P.u.uAngle, (c.angle || 0) * Math.PI / 180);
       const v = opts.view || [0.5, 0.5, 1, 1]; gl.uniform4f(P.u.uView, v[0], v[1], v[2], v[3]); gl.uniform2f(P.u.uSrcPx, this.srcW, this.srcH);
-      const MT = { none: 0, person: 1, bg: 2, sky: 3, skin: 4, hair: 5, water: 6, plants: 7, face: 8, all: 9 };
-      const A0 = new Float32Array(32), A1 = new Float32Array(32), A2 = new Float32Array(32), A3 = new Float32Array(32);
+      const MT = { none: 0, person: 1, bg: 2, sky: 3, skin: 4, hair: 5, water: 6, plants: 7, face: 8, all: 9, linear: 10, radial: 11 };
+      const A0 = new Float32Array(32), A1 = new Float32Array(32), A2 = new Float32Array(32), A3 = new Float32Array(32), A4 = new Float32Array(32), A5 = new Float32Array(32), A6 = new Float32Array(32);
       LL.forEach((l, i) => { const q = (k) => (l[k] || 0) / 100;
         A0.set([q('exp'), q('con'), q('hl'), q('sh')], i * 4); A1.set([q('sat'), q('temp'), q('tint'), q('clar')], i * 4); A2.set([q('sharp'), q('dehaze'), 0, 0], i * 4);
-        A3.set([MT[l.mask] ?? 0, l.inv ? 1 : 0, (l.amt ?? 100) / 100, (l.slot ?? i)], i * 4); });
+        A3.set([MT[l.mask] ?? 0, l.inv ? 1 : 0, (l.amt ?? 100) / 100, (l.slot ?? i)], i * 4);
+        const g = l.geo || {}; if (l.mask === 'linear') A4.set([g.x0 ?? .5, g.y0 ?? .1, g.x1 ?? .5, g.y1 ?? .5], i * 4); else if (l.mask === 'radial') { A4.set([g.cx ?? .5, g.cy ?? .5, g.rx ?? .25, g.ry ?? .25], i * 4); A5.set([(g.f ?? 50) / 100, g.rot || 0, 0, 0], i * 4); }
+        if (l.tintA) { const h = (l.tintC || '#ffa040').replace('#', ''); A6.set([parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255, l.tintA / 100], i * 4); } });
+      gl.uniform4fv(P.u.uP4, A4); gl.uniform4fv(P.u.uP5, A5); gl.uniform4fv(P.u.uP6, A6);
       gl.uniform4fv(P.u.uP0, A0); gl.uniform4fv(P.u.uP1, A1); gl.uniform4fv(P.u.uP2, A2); gl.uniform4fv(P.u.uP3, A3);
       // 天空
       this.bind(P, 'uWt', 7, this.t.W.tex); this.bind(P, 'uBase', 8, this.baseTex); this.bind(P, 'uSkyRef', 9, this.skyRefTex || this.emptyMask); this.bind(P, 'uFgRef', 10, this.fgRefTex || this.emptyMask);
@@ -1061,11 +1148,14 @@ export class Engine {
       const wantLut = e.lutPath && e.lutAmt > 0; if (wantLut && this.lutKey !== e.lutPath) this.loadLUT(e.lutPath);
       const hasLut = wantLut && this.lutKey === e.lutPath && this.lutTex; gl.activeTexture(gl.TEXTURE12); gl.bindTexture(gl.TEXTURE_3D, hasLut ? this.lutTex : this.emptyLut()); gl.uniform1i(P.u.uLut, 12);
       gl.uniform1i(P.u.uHasLut, hasLut ? 1 : 0); g1('uLutAmt', (e.lutAmt ?? 100) / 100); gl.uniform1i(P.u.uHasDepth, this.hasDepth ? 1 : 0);
+      const wantFive = e.fivekAmt > 0 && e.fivekW; if (wantFive) this.ensureFivek(e.fivekW);
+      gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_3D, wantFive && this.fiveTex ? this.fiveTex : this.emptyLut()); gl.uniform1i(P.u.uFive, 14); gl.uniform1i(P.u.uHasFive, wantFive && this.fiveTex ? 1 : 0); g1('uFiveAmt', (e.fivekAmt || 0) / 100);
+      this.bind(P, 'uLowG', 13, this.lowGainTex || this.emptyMask); gl.uniform1i(P.u.uHasLow, this.lowGainTex ? 1 : 0); g1('uLowAmt', (e.lowLight || 0) / 100);
       g1('uAtmo', (e.atmo || 0) / 100); g1('uAtmoNear', (e.atmoNear ?? 40) / 100); g1('uAtmoTone', (e.atmoTone || 0) / 100); g1('uLDepth', (e.ldepth || 0) / 100);
       g1('uScHi', (e.scHi || 0) / 100); g1('uScMid', (e.scMid || 0) / 100); g1('uScLo', (e.scLo || 0) / 100);
       g1('uRays', (e.rays || 0) / 100); g1('uRaysLen', 0.35 + (e.raysLen ?? 50) / 100 * 0.65); g1('uRaysWarm', (e.raysWarm ?? 50) / 100);
       const sun = this.srcToOut(e.sun || { x: 0.65, y: 0.12 }, c, v); gl.uniform2f(P.u.uSun, sun[0], sun[1]);
-      g1('uLensK', (e.lensDist || 0) / 100 * 0.25);
+      gl.uniform3f(P.u.uGeo, ...geoU(e)); g1('uLensK', (e.lensDist || 0) / 100 * 0.25); { const L = e.lensProf && e.lensP ? e.lensP : null; gl.uniform4f(P.u.uLP, L && L.dist ? L.m : 0, L?.a || 0, L?.b || 0, L?.c || 0); gl.uniform4f(P.u.uLP2, L?.k1 || 0, L?.k2 || 0, L?.s || 1, L?.fix || 1); }
       this.warpUniforms(P); this.quad(); return;
     }
     this.prepare(e); this.setCurve(e.curve);
@@ -1083,7 +1173,10 @@ export class Engine {
     gl.uniform2f(P.u.uOutSize, W, H); gl.uniform2f(P.u.uSrcPx, this.srcW, this.srcH);
     const c = e.crop || DEFAULT_EDITS().crop;
     gl.uniform4f(P.u.uCrop, c.cx, c.cy, c.w, c.h); gl.uniform1f(P.u.uAngle, (c.angle || 0) * Math.PI / 180);
+    gl.uniform3f(P.u.uGeo, ...geoU(e));
     gl.uniform1f(P.u.uLensK, (e.lensDist || 0) / 100 * 0.25); gl.uniform1f(P.u.uLensCA, (e.lensCA || 0) / 100 * 0.004);
+    { const L = e.lensProf && e.lensP ? e.lensP : null; gl.uniform4f(P.u.uLP, L && L.dist ? L.m : 0, L?.a || 0, L?.b || 0, L?.c || 0); gl.uniform4f(P.u.uLP2, L?.k1 || 0, L?.k2 || 0, L?.s || 1, L?.fix || 1);
+      gl.uniform2f(P.u.uLT, L && L.tca ? L.kr : 1, L && L.tca ? L.kb : 1); gl.uniform4f(P.u.uLV, L?.v1 || 0, L?.v2 || 0, L?.v3 || 0, L && L.vig ? 1 : 0); }
     const v = opts.view || [0.5, 0.5, 1, 1]; gl.uniform4f(P.u.uView, v[0], v[1], v[2], v[3]);
     gl.uniform1f(P.u.uBaseSat, this.baseSat);
     const f = (n, val) => gl.uniform1f(P.u[n], val);
@@ -1093,7 +1186,7 @@ export class Engine {
     f('uSmooth', e.smooth / 100); f('uBlemish', e.blemish / 100); f('uDark', e.darkCircle / 100); f('uTeeth', e.teeth / 100); f('uEyes', e.eyeBright / 100);
     f('uSubject', e.subjectLight / 100); f('uSkinEven', (e.skinEven || 0) / 100); f('uBgBlur', e.bgBlur / 100); f('uSky', e.sky / 100);
     gl.uniform1fv(P.u.uHslH, e.hslH.map(x => x / 100)); gl.uniform1fv(P.u.uHslS, e.hslS.map(x => x / 100)); gl.uniform1fv(P.u.uHslL, e.hslL.map(x => x / 100));
-    for (const [u, k, d] of [['uStructure','structure',100],['uMatte','matte',100],['uSkinHue','skinHue',100],['uSkinSat','skinSat',100],['uSkinLum','skinLum',100],['uFaceLight','faceLight',100],['uContour','contour',100],['uLips','lips',100],['uBrows','brows',100],['uBlush','blush',100],['uBgLight','bgLight',100],['uBgSat','bgSat',100],['uBgClean','bgClean',100],['uSkyRep','skyRep',100],['uFog','fog',100],['uDust','dust',100],['uCmAmt','cmAmt',100]]) f(u, (e[k] || 0) / d);
+    for (const [u, k, d] of [['uRosy','rosy',100],['uStructure','structure',100],['uMatte','matte',100],['uSkinHue','skinHue',100],['uSkinSat','skinSat',100],['uSkinLum','skinLum',100],['uFaceLight','faceLight',100],['uContour','contour',100],['uLips','lips',100],['uBrows','brows',100],['uBlush','blush',100],['uBgLight','bgLight',100],['uBgSat','bgSat',100],['uBgClean','bgClean',100],['uSkyRep','skyRep',100],['uFog','fog',100],['uDust','dust',100],['uCmAmt','cmAmt',100]]) f(u, (e[k] || 0) / d);
     if (!e.cm) f('uCmAmt', 0);
     const cm = e.cm || { s: [1, 1, 1], o: [0, 0, 0] }; gl.uniform3fv(P.u.uCmS, cm.s); gl.uniform3fv(P.u.uCmO, cm.o);
     const HAIR = { brown: '#7a4a2a', chestnut: '#5a2e1a', blonde: '#d8b878', wine: '#7a1f35', black: '#1a1716', gray: '#a8a8ad', ash: '#8c8478', pink: '#d8899e' };
@@ -1106,6 +1199,8 @@ export class Engine {
     const BWF = { none: [0.3, 0.59, 0.11], ye: [0.42, 0.52, 0.06], r: [0.72, 0.28, 0.0], g: [0.22, 0.72, 0.06] };
     gl.uniform3fv(P.u.uBwW, BWF[e.bwFilter] || BWF.none); gl.uniform3f(P.u.uBwTone, (e.bwToneH ?? 35) / 360, 0, (e.bwToneS || 0) / 100);
     gl.uniform3f(P.u.uGradeS, (e.gradeSH ?? 200) / 360, 0, (e.gradeSS || 0) / 100); gl.uniform3f(P.u.uGradeH, (e.gradeHH ?? 40) / 360, 0, (e.gradeHS || 0) / 100);
+    { const cg = new Float32Array(16); [['S', 'shadow'], ['M', 'mid'], ['H', 'high'], ['G', 'global']].forEach(([k], i) => cg.set([(e['cg' + k + 'h'] || 0) / 360, (e['cg' + k + 's'] || 0) / 100, (e['cg' + k + 'l'] || 0) / 100, 0], i * 4)); gl.uniform4fv(P.u.uCg, cg); f('uCgBlend', (e.cgBlend ?? 50) / 100); f('uCgBal', (e.cgBal || 0) / 100);
+      const pc = (e.pointColors || []).slice(0, 4); const pa = new Float32Array(16), pl = new Float32Array(4); pc.forEach((q, i) => { pa.set([q.h / 360, (q.range ?? 30) / 360 + 0.01, (q.dh || 0) / 100, (q.ds || 0) / 100], i * 4); pl[i] = (q.dl || 0) / 100; }); gl.uniform1i(P.u.uPCN, pc.length); gl.uniform4fv(P.u.uPC, pa); gl.uniform1fv(P.u.uPCL, pl); }
     f('uGradeBal', (e.gradeBal || 0) / 100); f('uChrome', (e.chrome || 0) / 100); f('uChromeBlue', (e.chromeBlue || 0) / 100); f('uBleach', (e.bleach || 0) / 100);
     f('uFocusAmt', e.focus ? (e.focusAmt || 0) / 100 : 0); f('uFocusRange', (e.focusRange ?? 15) / 100 * 0.4); gl.uniform1i(P.u.uHasDepth, this.hasDepth ? 1 : 0);
     f('uFocusD', e.focus && this.depthAt ? this.depthAt(e.focus.x, e.focus.y) : 0.5);

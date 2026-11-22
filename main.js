@@ -169,6 +169,7 @@ function setupIpc() {
     return { files: dedupePairs(files), roots };
   });
   ipcMain.handle('photo:update', (_e, projectId, ids, patch) => store.updatePhotos(projectId, ids, patch));
+  ipcMain.handle('photo:duplicate', (_e, projectId, ids) => store.duplicatePhotos(projectId, ids));
   ipcMain.handle('photo:remove', (_e, projectId, ids) => store.removePhotos(projectId, ids));
   ipcMain.handle('photo:reveal', (_e, file) => shell.showItemInFolder(file));
   ipcMain.handle('presets:save', (_e, presets) => store.savePresets(presets));

@@ -1,9 +1,9 @@
 // Capy Photo — 介面與流程
-import { Engine, DEFAULT_EDITS, isDefault, isFullCrop, effective } from './engine.js';
+import { Engine, DEFAULT_EDITS, isDefault, isFullCrop, effective, rasterStrokes } from './engine.js';
 import { decodeRaw, decodeImage, cameraLook, fileURL } from './raw.js';
-import { initAI, analyzeForCulling, buildMasks, pinsFor } from './ai.js';
+import { initAI, analyzeForCulling, buildMasks, pinsFor, facesForEyes } from './ai.js';
 import { applyHeals, detectLines, encodeRLE } from './heal.js';
-import { deblurAI, backend as mlBackend } from './ml.js';
+import { segPerson, deblurAI, denoiseAI, lowLightGain, fivekWeights, fivekLUT, upscaleAI, backend as mlBackend } from './ml.js';
 import { optimize, SCENE_NAMES } from './optimize.js';
 
 const $ = (s) => document.querySelector(s);
@@ -12,7 +12,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 const COLORS = { red: '#d9534f', yellow: '#e8b04a', green: '#5cb85c', blue: '#4a8fe0', purple: '#9b6ce0' };
-const AI_KEYS = ['smooth', 'blemish', 'skinEven', 'darkCircle', 'teeth', 'eyeBright', 'eyeEnlarge', 'slim', 'subjectLight', 'bgBlur', 'sky', 'enhance', 'matte', 'skinHue', 'skinSat', 'skinLum', 'faceLight', 'contour', 'lips', 'brows', 'blush', 'bgLight', 'bgSat', 'bgClean', 'skyRep', 'fog', 'dust', 'structure', 'hairAmt', 'hairLum', 'waist', 'bodySlim', 'water', 'waterColor', 'twilight', 'bgRep', 'focusAmt', 'atmo', 'ldepth'];
+const AI_KEYS = ['smooth', 'blemish', 'skinEven', 'darkCircle', 'teeth', 'eyeBright', 'eyeEnlarge', 'slim', 'subjectLight', 'bgBlur', 'sky', 'enhance', 'matte', 'skinHue', 'skinSat', 'skinLum', 'faceLight', 'contour', 'lips', 'brows', 'blush', 'bgLight', 'bgSat', 'bgClean', 'skyRep', 'fog', 'dust', 'structure', 'hairAmt', 'hairLum', 'waist', 'bodySlim', 'water', 'waterColor', 'twilight', 'bgRep', 'focusAmt', 'atmo', 'ldepth', 'rosy'];
 const needsAI = (e) => AI_KEYS.some(k => e[k]) || (e.local || []).length > 0;
 // 富士底片模擬（依官方描述與常見特性調配，只改「色彩風格」，不動曝光、白平衡與人像修飾）
 const FILM_LOOK_KEYS = ['contrast', 'highlights', 'shadows', 'whites', 'blacks', 'vibrance', 'saturation', 'clarity', 'hslH', 'hslS', 'hslL', 'curve', 'grain', 'bw', 'bwFilter', 'bwToneH', 'bwToneS', 'gradeSH', 'gradeSS', 'gradeHH', 'gradeHS', 'gradeBal', 'chrome', 'chromeBlue', 'bleach', 'dehaze', 'halation'];
@@ -209,7 +209,32 @@ function tileHTML(p) {
     ${p.flag === 1 ? '<div class="flag">⚑</div>' : p.flag === -1 ? '<div class="flag rej">✕</div>' : ''}
     ${p.edits ? '<div class="edited">✎</div>' : ''}
     ${p.color ? `<div class="cbar" style="background:${COLORS[p.color]}"></div>` : ''}
-    <div class="meta"><span class="stars">${'★'.repeat(r)}<i>${'★'.repeat(5 - r)}</i></span><span class="fn">${esc(p.name)}</span></div></div>`;
+    ${thumbMetaHTML(p, r)}</div>`;
+}
+// 縮圖下方資訊：每個欄位可選放在哪一行的左/右，或隱藏（設定 → 縮圖資訊）
+const INFO_FIELDS = [['name', '檔名'], ['rating', '星等'], ['date', '拍攝時間'], ['camera', '相機'], ['lens', '鏡頭'], ['expo', '光圈 / 快門 / ISO'], ['focal', '焦距'], ['dims', '尺寸（像素）'], ['size', '檔案大小'], ['ext', '格式'], ['color', '色標'], ['folder', '資料夾']];
+const INFO_SLOTS = [['L1', '第 1 行左'], ['R1', '第 1 行右'], ['L2', '第 2 行左'], ['R2', '第 2 行右'], ['L3', '第 3 行左'], ['R3', '第 3 行右'], ['off', '不顯示']];
+const INFO_DEFAULT = { rating: 'L1', name: 'R1', expo: 'L2', date: 'R2' };
+function infoValue(p, k, r) {
+  const i = p.info || {};
+  if (k === 'name') return `<span class="fn">${esc(p.name)}</span>`;
+  if (k === 'rating') return `<span class="stars">${'★'.repeat(r)}<i>${'★'.repeat(5 - r)}</i></span>`;
+  if (k === 'date') return esc((i.date || '').replace(/^(\d{4}):(\d\d):(\d\d) (\d\d:\d\d).*/, '$1/$2/$3 $4'));
+  if (k === 'camera') return esc(i.model || '');
+  if (k === 'lens') return esc(i.lens || '');
+  if (k === 'expo') { const e = []; if (i.fnum) e.push('f/' + (+i.fnum).toFixed(1).replace(/\.0$/, '')); if (i.exposure) e.push(i.exposure >= 1 ? i.exposure + 's' : '1/' + Math.round(1 / i.exposure)); if (i.iso) e.push('ISO ' + i.iso); return e.join(' · '); }
+  if (k === 'focal') return i.focal ? Math.round(i.focal) + 'mm' : '';
+  if (k === 'dims') { const d = p.dims || [i.width, i.height]; return d && d[0] ? `${d[0]}×${d[1]}` : ''; }
+  if (k === 'size') return p.size ? (p.size / 1048576).toFixed(1) + ' MB' : '';
+  if (k === 'ext') return esc(p.ext || '');
+  if (k === 'color') return p.color ? `<span style="color:${COLORS[p.color]}">●</span> ${(COLORS_L.find(c => c[0] === p.color) || [, ''])[1]}` : '';
+  if (k === 'folder') return esc(p.folder || '');
+  return '';
+}
+function thumbMetaHTML(p, r) {
+  const conf = S.settings.thumbInfo || INFO_DEFAULT; const rows = { 1: { L: [], R: [] }, 2: { L: [], R: [] }, 3: { L: [], R: [] } };
+  for (const [k] of INFO_FIELDS) { const sl = conf[k]; if (!sl || sl === 'off') continue; const v = infoValue(p, k, r); if (v) rows[sl[1]][sl[0]].push(v); }
+  return [1, 2, 3].filter(n => rows[n].L.length || rows[n].R.length).map(n => `<div class="meta"><span class="ml">${rows[n].L.join(' ')}</span><span class="mr">${rows[n].R.join(' ')}</span></div>`).join('');
 }
 
 function renderGrid() {
@@ -510,7 +535,7 @@ function switchView(v) {
 async function openEdit(id) {
   const p = photoById(id); if (!p) return;
   if (E.photo && E.photo.id !== id) await commitEditThumb(E.photo);
-  if (!engine) { try { engine = new Engine($('#cv')); engine.onSkyLoaded = () => draw(); } catch (err) { toast('無法啟動圖形引擎：' + err.message, 6000); return; } }
+  if (!engine) { try { engine = new Engine($('#cv')); engine.onSkyLoaded = () => draw(); engine.onNeedFive = (w, cb) => fivekLUT(w).then(cb); } catch (err) { toast('無法啟動圖形引擎：' + err.message, 6000); return; } }
   S.focus = id; if (!S.sel.has(id) || S.sel.size <= 1) { S.sel.clear(); S.sel.add(id); }
   E.photo = p; E.edits = { ...DEFAULT_EDITS(), ...clone(p.edits || {}) }; E.undo = []; E.redo = []; E.masks = null; E.maskState = 'none'; E.split = null; E.zoom = 'fit'; E.crop = false; E.healMode = false; E.focusMode = false; E.healKey = ''; E.layerSel = null; if (E.brushMode) setBrushMode(false); E.deblurDone = 0;
   renderEditSide(); renderEditBar(); renderTools(); renderFilm();
@@ -531,7 +556,9 @@ async function openEdit(id) {
     E.src = c.src;
     engine.setSource(c.src); engine.setBase(c.look.lut, c.look.sat);
     if ((E.edits.heal || []).length) { engine.prepare(E.edits); setBusy('套用物件移除…'); await sleep(20); refreshHeal(); }
-    if (E.edits.deblur) { engine.prepare(E.edits); scheduleDeblur(); }
+    engine.setLowGain(null);
+    if (E.edits.deblur || E.edits.aiDenoise) { engine.prepare(E.edits); scheduleDeblur(); }
+    if (E.edits.lowLight > 0) computeLowGain();
     ph.classList.add('hidden'); $('#cv').style.visibility = 'visible';
     layoutCanvas(); draw();
     setBusy(null);
@@ -553,7 +580,7 @@ async function loadMasks(token) {
     const img = engine.renderPixels(base, w, h);
     const m = await buildMasks(img);
     if (token !== E.decodeToken) return;
-    E.masks = m; engine.setMasks(m); engine.setPins(pinsFor(m.pins, E.edits));
+    E.masks = m; engine.setMasks(applyMaskFix(m, E.edits.maskFix)); engine.setPins(pinsFor(m.pins, E.edits));
     if (E.edits.enhance && !E.edits.enhanceVec) { E.edits.enhanceVec = enhanceVector(engine, E.edits, m); persistEdits(); }
     E.maskState = 'ready'; if (E.tab === 'creative') renderTools();
   } catch (err) { console.warn('masks', err); E.maskState = 'error'; }
@@ -569,7 +596,8 @@ function setBusy(t) { const b = $('#busy'); if (!t) { b.classList.add('hidden');
 function layoutCanvas() {
   const v = $('#viewer'), cv = $('#cv');
   if (!engine?.srcTex) return;
-  const vw = v.clientWidth - 24, vh = v.clientHeight - 24;
+  const sbs = E.sbs && !E.crop && !E.healMode;
+  const vw = (v.clientWidth - 24) / (sbs ? 2 : 1) - (sbs ? 6 : 0), vh = v.clientHeight - 24 - (sbs ? 20 : 0);
   const c = E.crop ? fullFrame(E.edits.crop.angle) : E.healMode ? { cx: .5, cy: .5, w: 1, h: 1, angle: 0 } : E.edits.crop;
   const cw = c.w * engine.srcW, ch = c.h * engine.srcH;
   const dpr = window.devicePixelRatio || 1;
@@ -584,7 +612,8 @@ function layoutCanvas() {
     E.pan[0] = Math.max(zw / 2, Math.min(1 - zw / 2, E.pan[0])); E.pan[1] = Math.max(zh / 2, Math.min(1 - zh / 2, E.pan[1]));
     E.view = [E.pan[0], E.pan[1], cv.width / cw, cv.height / ch];
   }
-  cv.classList.toggle('zoomed', E.zoom !== 'fit');
+  cv.classList.toggle('zoomed', E.zoom !== 'fit'); setTimeout(positionGrad, 0);
+  const c0 = $('#cv0'); $('#cv0wrap').classList.toggle('hidden', !sbs); if (sbs) { c0.width = cv.width; c0.height = cv.height; c0.style.width = cv.style.width; c0.style.height = cv.style.height; }
   positionSplit(); positionCrop();
 }
 let rafId = 0;
@@ -594,7 +623,8 @@ function draw() {
     rafId = 0; if (!engine?.srcTex) return;
     const e = E.hover ? E.hover : E.edits;
     const ed = E.crop ? { ...e, crop: fullFrame(e.crop.angle) } : E.healMode ? { ...e, crop: { cx: .5, cy: .5, w: 1, h: 1, angle: 0 } } : e;
-    engine.render(ed, { view: E.view, split: E.split, showLayer: E.showMask && E.tab === 'local' && !E.hover ? (E.layerSel ?? -1) : -1 });
+    if (E.sbs && !E.crop && !E.healMode) { engine.render(ed, { view: E.view, split: 2, noPost: true }); const c0 = $('#cv0'); const x0 = c0.getContext('2d'); x0.drawImage($('#cv'), 0, 0, c0.width, c0.height); }
+    engine.render(ed, { view: E.view, split: E.sbs ? null : E.split, showLayer: E.showMask && tabVisible('layers') && !E.hover ? (E.layerSel ?? -1) : -1, showMask: E.maskShow && tabVisible('ai') && !E.hover ? (MASK_CH.find(c => c[0] === (E.maskSel || 'skin'))) : null });
     histSoon();
   });
 }
@@ -616,7 +646,9 @@ function setEdit(patch, opts = {}) {
   Object.assign(E.edits, patch);
   if ('slim' in patch || 'eyeEnlarge' in patch || 'waist' in patch || 'bodySlim' in patch) engine.setPins(pinsFor(E.masks?.pins, E.edits));
   if ('crop' in patch) layoutCanvas();
-  if ('deblur' in patch && !opts.noDeblur) scheduleDeblur();
+  if ('maskFix' in patch && E.masks) engine.setMasks(applyMaskFix(E.masks, E.edits.maskFix));
+  if (('deblur' in patch || 'aiDenoise' in patch) && !opts.noDeblur) scheduleDeblur();
+  if ('lowLight' in patch && E.edits.lowLight > 0 && !engine.lowGainTex) computeLowGain();
   draw();
   clearTimeout(saveT); saveT = setTimeout(persistEdits, 500);
 }
@@ -629,8 +661,8 @@ async function persistEdits() {
   await api.updatePhotos(S.cur.id, [p.id], { edits: val });
   renderFilmItem(p.id);
 }
-function undo() { if (E.pendingUndo) { E.undo.push(E.pendingUndo); E.pendingUndo = null; } const s = E.undo.pop(); if (!s) return; E.redo.push(clone(E.edits)); E.edits = s; engine.setPins(pinsFor(E.masks?.pins, E.edits)); layoutCanvas(); draw(); renderTools(); persistEdits(); historyLog.push('復原'); renderHistory(); }
-function redoFn() { const s = E.redo.pop(); if (!s) return; E.undo.push(clone(E.edits)); E.edits = s; engine.setPins(pinsFor(E.masks?.pins, E.edits)); layoutCanvas(); draw(); renderTools(); persistEdits(); }
+function undo() { if (E.pendingUndo) { E.undo.push(E.pendingUndo); E.pendingUndo = null; } const s = E.undo.pop(); if (!s) return; E.redo.push(clone(E.edits)); E.edits = s; engine.setPins(pinsFor(E.masks?.pins, E.edits)); if (E.masks) engine.setMasks(applyMaskFix(E.masks, E.edits.maskFix)); layoutCanvas(); draw(); renderTools(); persistEdits(); historyLog.push('復原'); renderHistory(); }
+function redoFn() { const s = E.redo.pop(); if (!s) return; E.undo.push(clone(E.edits)); E.edits = s; engine.setPins(pinsFor(E.masks?.pins, E.edits)); if (E.masks) engine.setMasks(applyMaskFix(E.masks, E.edits.maskFix)); layoutCanvas(); draw(); renderTools(); persistEdits(); }
 
 // 離開照片時，以目前修圖產生新縮圖
 async function commitEditThumb(p) {
@@ -678,7 +710,8 @@ function renderEditBar() {
   const p = E.photo; const list = filtered(); const i = list.findIndex(x => x.id === p.id);
   const n = S.sel.size > 1 ? S.sel.size - (S.sel.has(p.id) ? 1 : 0) : 0;
   $('#editBar').innerHTML = `<span class="ttl">${esc(p.name)}</span><span>${i + 1} / ${list.length}</span><div class="spacer"></div>
-  <span class="lnk ${E.split != null ? 'on' : ''}" id="tBefore" title="快捷鍵 \\">◧ 修圖前後對比</span>
+  <span class="lnk ${E.split != null ? 'on' : ''}" id="tBefore" title="快捷鍵 \\">◧ 前後對比（滑桿）</span>
+  <span class="lnk ${E.sbs ? 'on' : ''}" id="tSbs" title="快捷鍵 Y">◫ 左右雙畫面</span>
   <span class="lnk" id="tZoom" title="點畫面也可以切換">${E.zoom === 'fit' ? '符合視窗' : '100%'}</span>
   <span class="lnk" id="tUndo" title="Ctrl+Z">↶</span><span class="lnk" id="tRedo" title="Ctrl+Y">↷</span>
   <div class="btn sm" id="tCopy">複製設定</div><div class="btn sm" id="tPaste">貼上設定</div>
@@ -702,14 +735,19 @@ const GROUPS = {
     { title: '底片模擬', filmUI: true },
     { title: '色彩', items: [SL('vibrance', '自然飽和', -100, 100), SL('saturation', '飽和度', -100, 100)] },
     { title: 'HSL / 顏色', hsl: true },
+    { title: '色彩分級（色輪）', cgUI: true, items: [SL('cgBlend', '混合', 0, 100), SL('cgBal', '平衡', -100, 100)] },
+    { title: '點顏色（色相環點選）', pcUI: true },
     { title: '色調曲線', curve: true },
-    { title: '鏡頭校正', items: [SL('lensDist', '變形校正（桶狀↔枕狀）', -100, 100), SL('lensCA', '紫邊 / 色差校正', -100, 100)] },
-    { title: '細節', items: [SL('sharpen', '銳利化', 0, 150), SL('texture', '紋理', -100, 100), SL('denoise', '降噪', 0, 100), SL('colorNoise', '色彩雜訊', 0, 100), SL('dust', '去除灰塵', 0, 100)] }
+    { title: '幾何（透視校正）', extra: '<span class="x" data-act="autoUpright">✦ 自動</span>', items: [SL('geoV', '垂直透視', -100, 100), SL('geoH', '水平透視', -100, 100), SL('geoScale', '縮放', -50, 50)], note: '修正建築往上收窄、往旁邊傾斜的變形；「自動」會偵測畫面中的直線自動拉正。' },
+    { title: '鏡頭校正', lensUI: true, items: [SL('lensDist', '手動變形校正（桶狀↔枕狀）', -100, 100), SL('lensCA', '手動紫邊 / 色差校正', -100, 100)] },
+    { title: 'AI 調色與光線', ai: true, extra: '<span class="x" data-act="fivek">✦ AI 專業調色</span>', items: [SL('fivekAmt', '專業調色強度（FiveK）', 0, 100), SL('lowLight', 'AI 暗部提亮（夜景 / 逆光）', 0, 100)], note: '「AI 專業調色」用 MIT-Adobe FiveK 專業修圖師資料訓練的模型，依照片內容自動產生調色 LUT；「暗部提亮」用 Zero-DCE 模型逐像素提亮暗處、不讓亮處過曝。' },
+    { title: '細節', items: [SL('aiDenoise', 'AI 降噪（FFDNet）', 0, 100), SL('sharpen', '銳利化', 0, 150), SL('texture', '紋理', -100, 100), SL('denoise', '降噪', 0, 100), SL('colorNoise', '色彩雜訊', 0, 100), SL('dust', '去除灰塵', 0, 100)] }
   ],
   ai: [
     { title: '皮膚', ai: true, extra: '<span class="x" data-act="beauty">✦ 一鍵美化</span>', items: [SL('smooth', '膚質平滑', 0, 100), SL('blemish', '去瑕疵', 0, 100), SL('skinEven', '膚色均勻', 0, 100), SL('matte', '去油光', 0, 100)] },
-    { title: '膚色', ai: true, items: [SL('skinHue', '色調', -100, 100), SL('skinSat', '飽和度', -100, 100), SL('skinLum', '亮度', -100, 100)] },
+    { title: '膚色', ai: true, items: [SL('rosy', '紅潤（白裡透紅）', 0, 100), SL('skinHue', '色調', -100, 100), SL('skinSat', '飽和度', -100, 100), SL('skinLum', '亮度', -100, 100)] },
     { title: '臉部', ai: true, items: [SL('faceLight', '臉部補光', -100, 100), SL('contour', '立體光影', 0, 100), SL('darkCircle', '去黑眼圈', 0, 100), SL('eyeBright', '眼睛提亮', 0, 100), SL('teeth', '牙齒美白', 0, 100), SL('lips', '唇色', -100, 100), SL('brows', '眉毛加深', 0, 100), SL('blush', '腮紅', 0, 100)] },
+    { eyesUI: true },
     { title: '頭髮', ai: true, hair: true, items: [SL('hairAmt', '換髮色強度', 0, 100), SL('hairLum', '頭髮亮度', -100, 100)] },
     { title: '臉型與身形', ai: true, items: [SL('slim', '瘦臉', -100, 100), SL('eyeEnlarge', '放大眼睛', -100, 100), SL('waist', '腰身', -100, 100), SL('bodySlim', '整體瘦身', -100, 100)], body: true },
     { title: '主體與背景', ai: true, items: [SL('subjectLight', '主體補光', -100, 100), SL('bgLight', '背景亮度', -100, 100), SL('bgSat', '背景飽和', -100, 100), SL('bgClean', '背景淨化', 0, 100), SL('bgBlur', '背景模糊', 0, 100)] },
@@ -728,12 +766,14 @@ const GROUPS = {
     { title: '色彩比對', ai: true, cm: true },
     { title: '黑白', bw: true }
   ],
-  local: [{ localUI: true }, { refocusUI: true }, { healUI: true }],
+  layers: [{ localUI: true }],
+  local: [{ refocusUI: true }, { healUI: true }],
   crop: [{ cropUI: true }]
 };
 const HAIR_COLORS = [['brown', '棕', '#7a4a2a'], ['chestnut', '栗', '#5a2e1a'], ['blonde', '金', '#d8b878'], ['ash', '霧灰', '#8c8478'], ['wine', '酒紅', '#7a1f35'], ['pink', '粉', '#d8899e'], ['black', '黑', '#1a1716'], ['gray', '銀灰', '#a8a8ad']];
 const BG_TYPES = [['white', '白', '#fff'], ['black', '黑', '#0c0c0e'], ['gray', '灰漸層', '#8d9096'], ['studio', '棚拍藍灰', '#4a5260'], ['warm', '暖米色', '#e8d4bc'], ['blue', '天藍漸層', '#6f9fd6']];
 const LOCAL_MASKS = [['person', '人物'], ['bg', '背景'], ['sky', '天空'], ['skin', '皮膚'], ['hair', '頭髮'], ['face', '臉部'], ['water', '水面'], ['plants', '植物']];
+const SKY_PHOTOS = [['sky_a_clouds', '雲層藍天'], ['sky_b_clouds2', '高空卷雲'], ['sky_d_clear', '暖陽晴空'], ['sky_e_sun', '午後陽光'], ['sky_f_sunrise', '清晨深藍'], ['sky_g_dusk', '粉色黃昏']];
 const SKY_TYPES = [['blue', '藍天白雲'], ['clear', '晴朗無雲'], ['golden', '金黃時刻'], ['sunset', '夕陽'], ['dusk', '粉紫黃昏'], ['cloudy', '多雲'], ['storm', '暴風雨'], ['night', '星空夜晚'], ['custom', '📁 自訂照片…']];
 const HSL_COLORS = [['紅', '#e05050'], ['橙', '#e98a3c'], ['黃', '#e0c040'], ['綠', '#5cb85c'], ['青', '#3fc1c9'], ['藍', '#4a7fe0'], ['紫', '#8a5ce0'], ['洋紅', '#d04fb0']];
 
@@ -745,7 +785,7 @@ function groupKeys(g) {
   if (g.cropUI) return ['crop'];
   if (g.filmUI) return [...FILM_LOOK_KEYS, 'film'];
   return (g.items || []).map(i => i.key).concat(g.hsl ? ['hslH', 'hslS', 'hslL'] : [], g.curve ? ['curve'] : [], g.bw ? ['bw', 'bwFilter', 'bwToneH', 'bwToneS'] : [],
-    g.skyRep ? ['skyRep', 'skyType', 'skyImg', 'skyX', 'skyHorizon', 'skyBlend', 'skyBlur', 'skyExp', 'skyTemp', 'skyRelight', 'skyHaze', 'skyDetail', 'skyReflect'] : [], g.cm ? ['cm', 'cmAmt'] : [], g.hair ? ['hairColor'] : [], g.bgRep ? ['bgRep', 'bgType', 'bgColor'] : [], g.mist ? ['mistWarm'] : [], g.lutUI ? ['lutPath'] : [], g.items?.some(i => i.key === 'rays') ? ['sun'] : []);
+    g.skyRep ? ['skyRep', 'skyType', 'skyImg', 'skyX', 'skyHorizon', 'skyBlend', 'skyBlur', 'skyExp', 'skyTemp', 'skyRelight', 'skyHaze', 'skyDetail', 'skyReflect'] : [], g.cm ? ['cm', 'cmAmt'] : [], g.hair ? ['hairColor'] : [], g.bgRep ? ['bgRep', 'bgType', 'bgColor'] : [], g.mist ? ['mistWarm'] : [], g.lutUI ? ['lutPath'] : [], g.lensUI ? ['lensProf', 'lensP', 'lensName'] : [], g.cgUI ? ['cgSh', 'cgSs', 'cgSl', 'cgMh', 'cgMs', 'cgMl', 'cgHh', 'cgHs', 'cgHl', 'cgGh', 'cgGs', 'cgGl'] : [], g.pcUI ? ['pointColors'] : [], g.items?.some(i => i.key === 'rays') ? ['sun'] : []);
 }
 const sameVal = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 function resetKeys(keys, label) {
@@ -761,25 +801,28 @@ function resetGroup(g) {
   resetKeys(groupKeys(g), '重設「' + name + '」');
 }
 function groupChanged(g) { const d = DEFAULT_EDITS(); return groupKeys(g).some(k => !sameVal(E.edits[k], d[k])); }
-function resetBtn(gi) { return `<span class="rst" data-rstg="${gi}" title="把這一項回復成原始設定">↺ 重設</span>`; }
+function resetBtn(gi, tab = E.tab) { return `<span class="rst" data-rstg="${tab}:${gi}" title="把這一項回復成原始設定">↺ 重設</span>`; }
 function sliderHTML(s) {
   const v = E.edits[s.key]; const changed = v !== DEFAULT_EDITS()[s.key];
   const txt = s.fmt ? s.fmt(v) : (v > 0 && s.min < 0 ? '+' : '') + Math.round(v);
   return `<div class="sl"><label title="雙擊可重設">${s.label}</label><input type="range" class="${changed ? 'ch' : ''}" data-k="${s.key}" min="${s.min}" max="${s.max}" step="${s.step}" value="${v}"><em data-v="${s.key}" title="雙擊可重設">${txt}</em><span class="rsk ${changed ? '' : 'off'}" data-rstk="${s.key}" title="重設這個滑桿">↺</span></div>`;
 }
-function renderTools() {
-  if (!E.photo) return;
-  const tabs = [['basic', '基本'], ['ai', '人像 AI'], ['creative', '創意'], ['local', '局部'], ['crop', '裁切']];
-  let html = `<div class="ttabs">${tabs.map(([k, l]) => `<div class="ttab ${E.tab === k ? 'on' : ''}" data-tab="${k}">${l}</div>`).join('')}</div>`;
-  if (E.tab === 'basic') html += `<div class="sec"><div class="hist" style="height:80px"><canvas id="editHist" width="560" height="160"></canvas></div></div>`;
-  if (E.tab === 'ai') html += `<div class="sec" id="maskStatus"></div>`;
-  const withRst = (h, gi, g) => groupChanged(g) ? h.replace(/(<div class="sec"><div class="t">[\s\S]*?)(<\/div>)/, `$1${resetBtn(gi)}$2`) : h;
-  for (const [gi, g] of GROUPS[E.tab].entries()) {
+const TOOL_TABS = [['basic', '基本'], ['ai', '人像 AI'], ['creative', '創意'], ['layers', '圖層'], ['local', '局部'], ['crop', '裁切']];
+const panelState = (t) => (S.settings.panels || {})[t] || { mode: 'dock' };
+function setPanelState(t, st) { S.settings.panels = { ...(S.settings.panels || {}), [t]: { ...panelState(t), ...st } }; saveSettings(); }
+function tabVisible(t) { const m = panelState(t).mode; return m === 'float' || (m !== 'hidden' && E.tab === t); }
+function tabHTML(tab) {
+  let html = '';
+  if (tab === 'basic') html += `<div class="sec"><div class="hist" style="height:80px"><canvas id="editHist" width="560" height="160"></canvas></div></div>`;
+  if (tab === 'ai') html += `<div class="sec" id="maskStatus"></div>` + maskFixHTML();
+  const withRst = (h, gi, g) => groupChanged(g) ? h.replace(/(<div class="sec"><div class="t">[\s\S]*?)(<\/div>)/, `$1${resetBtn(gi, tab)}$2`) : h;
+  for (const [gi, g] of GROUPS[tab].entries()) {
     if (g.cropUI) { html += withRst(cropToolsHTML(), gi, g); continue; }
     if (g.refocusUI) { html += withRst(refocusHTML(), gi, g); continue; }
     if (g.healUI) { html += withRst(healToolsHTML(), gi, g); continue; }
+    if (g.eyesUI) { html += eyesHTML(); continue; }
     if (g.localUI) { html += withRst(localToolsHTML(), gi, g); continue; }
-    html += `<div class="sec"><div class="t"><span>${g.title}${g.ai ? ' <span class="ai">AI</span>' : ''}</span><span class="tx">${g.extra || ''}${groupChanged(g) ? resetBtn(gi) : ''}</span></div>`;
+    html += `<div class="sec"><div class="t"><span>${g.title}${g.ai ? ' <span class="ai">AI</span>' : ''}</span><span class="tx">${g.extra || ''}${groupChanged(g) ? resetBtn(gi, tab) : ''}</span></div>`;
     if (g.items) html += g.items.map(sliderHTML).join('');
     if (g.note) html += `<div class="hint">${g.note}</div>`;
     if (g.mist) html += `<div class="chips" style="margin-top:6px">${[['1/8', 30], ['1/4', 55], ['1/2', 85], ['1', 100]].map(([l, v]) => `<span class="chip ${E.edits.mist === v ? 'on' : ''}" data-mist="${v}">${l}</span>`).join('')}<span class="chip ${E.edits.mistWarm !== false ? 'on' : ''}" data-act="mistWarm">${E.edits.mistWarm !== false ? '✓ ' : ''}暖色光暈</span></div><div class="hint">模擬 Black Pro-Mist 濾鏡：亮部柔柔散開、暗部維持深黑，人像與夜景特別有電影感</div>`;
@@ -787,7 +830,7 @@ function renderTools() {
     if (g.body) html += `<div class="hint">${E.masks ? (E.masks.hasBody ? '已偵測到身形輪廓（含衣服、側身）' : '沒有偵測到身體，腰身與瘦身不會作用') : 'AI 分析中…'}</div>`;
     if (g.water) html += `<div class="hint">${E.masks ? (E.masks.hasWater ? 'AI 已找到水面範圍' : '沒有偵測到水面') : 'AI 分析中…'}</div>`;
     if (g.bgRep) html += `<div class="chips" style="margin-bottom:6px">${BG_TYPES.map(([k, l, c]) => `<span class="chip ${E.edits.bgType === k ? 'on' : ''}" data-bgtype="${k}"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${c};margin-right:4px;border:1px solid #555"></span>${l}</span>`).join('')}<label class="chip">自訂 <input type="color" id="bgColor" value="${E.edits.bgColor}" style="width:22px;height:14px;border:0;background:none;vertical-align:middle"></label></div>${sliderHTML(SL('bgRep', '換背景強度', 0, 100))}<div class="hint">匯出時選「PNG（透明背景）」可直接輸出去背圖。</div>`;
-    if (g.skyRep) html += `<div class="t" style="margin-top:10px"><span>天空替換</span></div><div class="chips" style="margin-bottom:6px">${SKY_TYPES.map(([k, l]) => `<span class="chip ${E.edits.skyType === k ? 'on' : ''}" data-skytype="${k}">${l}</span>`).join('')}</div>${E.edits.skyType === 'custom' && E.edits.skyImg ? `<div class="hint" style="margin-bottom:4px">自訂天空：${esc(decodeURIComponent(E.edits.skyImg.split('/').pop()))}</div>` : ''}${[SL('skyRep', '替換強度', 0, 100), SL('skyDetail', '邊緣細節', 0, 100), SL('skyHorizon', '地平線位置', -100, 100), SL('skyBlend', '地平線融合', 0, 100), SL('skyX', '天空左右位置', -100, 100), SL('skyExp', '天空亮度', -100, 100), SL('skyTemp', '天空色溫', -100, 100), SL('skyBlur', '天空景深', 0, 100), SL('skyRelight', '場景配色', 0, 100), SL('skyHaze', '大氣霧化', 0, 100), SL('skyReflect', '水面倒影', 0, 100)].map(sliderHTML).join('')}<div class="hint">${E.masks ? (E.masks.hasSky ? 'AI 已找到天空範圍；樹枝、電線、建築邊緣會逐像素分離，「邊緣細節」越高保留越多細枝' : '這張照片沒有偵測到天空') : 'AI 分析中…'}</div>`;
+    if (g.skyRep) html += `<div class="t" style="margin-top:10px"><span>天空替換</span></div><div class="chips" style="margin-bottom:6px">${SKY_TYPES.map(([k, l]) => `<span class="chip ${E.edits.skyType === k ? 'on' : ''}" data-skytype="${k}">${l}</span>`).join('')}</div><div class="hint" style="margin:2px 0 4px">真實天空照片（CC0 全景天空，經 AI 超解析度放大）</div><div class="chips" style="margin-bottom:6px">${SKY_PHOTOS.map(([k, l]) => `<span class="chip skyph ${E.edits.skyType === 'custom' && (E.edits.skyImg || '').includes(k) ? 'on' : ''}" data-skyph="${k}" style="background-image:url(app://bundle/models/skies/${k}.jpg)">${l}</span>`).join('')}</div>${E.edits.skyType === 'custom' && E.edits.skyImg && !E.edits.skyImg.includes('/skies/') ? `<div class="hint" style="margin-bottom:4px">自訂天空：${esc(decodeURIComponent(E.edits.skyImg.split('/').pop()))}</div>` : ''}${[SL('skyRep', '替換強度', 0, 100), SL('skyDetail', '邊緣細節', 0, 100), SL('skyHorizon', '地平線位置', -100, 100), SL('skyBlend', '地平線融合', 0, 100), SL('skyX', '天空左右位置', -100, 100), SL('skyExp', '天空亮度', -100, 100), SL('skyTemp', '天空色溫', -100, 100), SL('skyBlur', '天空景深', 0, 100), SL('skyRelight', '場景配色', 0, 100), SL('skyHaze', '大氣霧化', 0, 100), SL('skyReflect', '水面倒影', 0, 100)].map(sliderHTML).join('')}<div class="hint">${E.masks ? (E.masks.hasSky ? 'AI 已找到天空範圍；樹枝、電線、建築邊緣會逐像素分離，「邊緣細節」越高保留越多細枝' : '這張照片沒有偵測到天空') : 'AI 分析中…'}</div>`;
     if (g.cm) html += `<div class="hint" style="margin-bottom:6px">選一張已修好的照片當參考，讓這張的色調、亮度跟它一致（適合整場婚禮統一色調）。</div><div class="chips" style="margin-bottom:6px"><span class="chip" data-act="cmPick">${E.edits.cm ? '✓ 已比對 · 重新選擇參考照片' : '選擇參考照片…'}</span>${E.edits.cm ? '<span class="chip" data-act="cmClear">清除</span>' : ''}</div>${E.edits.cm ? sliderHTML(SL('cmAmt', '比對強度', 0, 100)) : ''}`;
     if (g.hsl) {
       const k = E.hslTab;
@@ -796,15 +839,58 @@ function renderTools() {
     }
     if (g.curve) html += `<canvas id="curve" width="560" height="400"></canvas><div class="hint">拖曳調整點，雙擊新增 / 刪除點 · <span class="x" data-act="curveReset" style="cursor:pointer;color:#e0874a">重設</span></div>`;
     if (g.lutUI) html += `<div class="chips" style="margin:4px 0"><span class="chip" data-act="lutPick">📁 載入 .cube LUT…</span>${E.edits.lutPath ? `<span class="chip" data-act="lutOff">✕ 移除</span>` : ''}</div><div class="hint">${E.edits.lutPath ? '目前：' + esc(decodeURIComponent(E.edits.lutPath.split('/').pop())) : '支援 Adobe / DaVinci 的 .cube 3D LUT 檔'}</div>`;
+    if (g.lensUI) { const e = E.edits; const m = lensMatch(); html += `<div class="chips" style="margin:2px 0 6px"><span class="chip ${e.lensProf ? 'on' : ''}" data-act="lensProf">${e.lensProf ? '✓ ' : ''}啟用鏡頭描述檔</span></div>
+      <div class="hint">${m ? `自動辨識：<b>${esc(m.maker + ' ' + m.model)}</b>（lensfun 資料庫，${E.photo.info?.focal ? Math.round(E.photo.info.focal) + 'mm' : ''}${E.photo.info?.fnum ? ' f/' + E.photo.info.fnum : ''}）<br>校正：${[m.dist.length ? '變形' : '', m.tca.length ? '色差' : '', m.vig.length ? '暗角' : ''].filter(Boolean).join('、') || '—'}` : (lensDB ? `資料庫中找不到這顆鏡頭（${esc(E.photo.info?.lens || '照片沒有鏡頭資訊')}），可以手動選擇或用下方手動校正。` : '載入鏡頭資料庫中…')}</div>
+      <div class="sl"><label>選擇鏡頭</label><input type="text" id="lensSearch" placeholder="輸入型號搜尋，例如 18-135" value="${esc(e.lensName || '')}" style="flex:1" list="lensList"><datalist id="lensList">${lensDB ? lensSearch(e.lensName || E.photo.info?.lens || '').map(l => `<option value="${esc(l.maker + ' ' + l.model)}">`).join('') : ''}</datalist></div>`; }
+    if (g.cgUI) html += `<div class="wheels">${[['S', '暗部'], ['M', '中間調'], ['H', '亮部'], ['G', '整體']].map(([k, l]) => { const h = E.edits['cg' + k + 'h'] || 0, sv = E.edits['cg' + k + 's'] || 0, lv = E.edits['cg' + k + 'l'] || 0; const r = sv / 100 * 50; const x = 50 + r * Math.sin(h * Math.PI / 180), y = 50 - r * Math.cos(h * Math.PI / 180);
+      return `<div class="wh"><div class="wl">${l}</div><div class="wheel" data-wheel="${k}"><i style="left:${x}%;top:${y}%"></i></div><div class="wv">色相 ${Math.round(h)}° · 飽和 ${Math.round(sv)}</div><input type="range" class="${lv ? 'ch' : ''}" data-k="cg${k}l" min="-100" max="100" value="${lv}" title="明度"></div>`; }).join('')}</div><div class="hint">在色輪上拖曳選色相與飽和度（越外圈越濃），下方滑桿調明度；雙擊色輪歸零。</div>`;
+    if (g.pcUI) { const P = E.edits.pointColors || []; html += `<div class="hint" style="margin-bottom:6px">點色相環選一個顏色（或用 💧 在照片上吸色），只調整接近這個顏色的部分，例如只讓天空更藍、膚色更紅潤。</div>
+      <div style="display:flex;gap:10px;align-items:center"><div class="ring" data-ring="1">${P.map((q, i) => `<i class="${i === (E.pcSel ?? 0) ? 'on' : ''}" style="left:${50 + 44 * Math.sin(q.h * Math.PI / 180)}%;top:${50 - 44 * Math.cos(q.h * Math.PI / 180)}%"></i>`).join('')}</div>
+      <div style="display:flex;flex-direction:column;gap:6px"><div class="btn sm" data-act="pcDrop">💧 從照片吸色</div>${P.length ? '<div class="btn sm" data-act="pcDel">✕ 刪除這個顏色</div>' : ''}<div class="chips">${P.map((q, i) => `<span class="chip ${i === (E.pcSel ?? 0) ? 'on' : ''}" data-pcsel="${i}"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:hsl(${q.h},80%,55%)"></span></span>`).join('')}</div></div></div>`;
+      const q = P[E.pcSel ?? 0]; if (q) html += [['dh', '色相偏移', -100, 100], ['ds', '飽和度', -100, 100], ['dl', '明度', -100, 100], ['range', '範圍', 5, 90]].map(([k, l, a, b]) => `<div class="sl"><label>${l}</label><input type="range" data-pck="${k}" min="${a}" max="${b}" value="${q[k] ?? (k === 'range' ? 30 : 0)}"><em>${q[k] ?? (k === 'range' ? 30 : 0)}</em></div>`).join(''); }
     if (g.filmUI) { const fm = E.edits.film; html += `<div class="sl"><label>底片</label><select id="filmSel" style="flex:1"><option value="">（無）</option>${FILMS.map(f => f.brand ? '' : f.cat ? `<optgroup label="${esc(f.cat.replace(/^柯達｜/, '柯達・'))}">` : `<option value="${f.id}" ${fm?.id === f.id ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}</select></div>${fm ? `<div class="sl"><label>強度</label><input type="range" id="filmAmt2" min="0" max="150" value="${fm.amt}"><em id="filmAmt2V">${fm.amt}</em></div>` : ''}`; }
     if (g.bw) html += `<div class="chips"><span class="chip ${E.edits.bw ? 'on' : ''}" data-act="bw">${E.edits.bw ? '✓ 黑白已開啟' : '轉成黑白'}</span></div>`;
     html += `</div>`;
   }
-  html += `<div style="display:flex;gap:6px;margin-top:6px"><div class="btn sm" data-act="resetAll">重設全部</div><div class="btn sm" data-act="resetTab">重設此分頁</div></div>`;
-  $('#tools').innerHTML = html;
-  if (E.tab === 'ai') renderMaskStatus();
+  html += `<div style="display:flex;gap:6px;margin-top:6px"><div class="btn sm" data-act="resetAll">重設全部</div><div class="btn sm" data-act="resetTab" data-rt="${tab}">重設此分頁</div></div>`;
+  return html;
+}
+function renderTools() {
+  if (!E.photo) return; setTimeout(positionGrad, 0);
+  if (panelState(E.tab).mode !== 'dock') { const d = TOOL_TABS.find(([k]) => panelState(k).mode === 'dock'); if (d) E.tab = d[0]; }
+  const dockedOk = panelState(E.tab).mode === 'dock';
+  const st0 = $('#tools').scrollTop; const fScroll = {}; document.querySelectorAll('.fpanel .fbody').forEach(el => fScroll[el.dataset.ft] = el.scrollTop);
+  let html = `<div class="ttabs">${TOOL_TABS.map(([k, l]) => { const m = panelState(k).mode; return `<div class="ttab ${E.tab === k && dockedOk ? 'on' : ''} ${m === 'float' ? 'fl' : m === 'hidden' ? 'hid' : ''}" data-tab="${k}" title="${m === 'float' ? '浮動中，點一下貼回' : m === 'hidden' ? '已隱藏，點一下顯示' : '雙擊可拉出成浮動視窗'}">${l}${m === 'float' ? ' ⧉' : ''}</div>`; }).join('')}</div>`;
+  if (dockedOk) html += `<div class="dockbar"><span class="x" data-pop="${E.tab}" title="拉出成浮動視窗">⧉ 浮動</span><span class="x" data-hide="${E.tab}" title="隱藏這個分頁">✕ 隱藏</span></div>` + tabHTML(E.tab);
+  else html += '<div class="hint" style="padding:20px">所有分頁都已浮動或隱藏，點上方分頁可以貼回。</div>';
+  html += `<div id="floats">${TOOL_TABS.filter(([k]) => panelState(k).mode === 'float').map(([k, l]) => { const p = panelState(k); return `<div class="fpanel ${p.collapsed ? 'col' : ''}" data-ft="${k}" style="left:${p.x ?? 120}px;top:${p.y ?? 120}px;width:${p.w ?? 320}px"><div class="fhead" data-drag="${k}"><span>${l}</span><span class="fb" data-collapse="${k}" title="收合">${p.collapsed ? '▢' : '—'}</span><span class="fb" data-dock="${k}" title="貼回右側面板">⇲</span><span class="fb" data-hide="${k}" title="隱藏">✕</span></div><div class="fbody" data-ft="${k}">${p.collapsed ? '' : tabHTML(k)}</div></div>`; }).join('')}</div>`;
+  $('#tools').innerHTML = html; $('#tools').scrollTop = st0; document.querySelectorAll('.fpanel .fbody').forEach(el => { if (fScroll[el.dataset.ft]) el.scrollTop = fScroll[el.dataset.ft]; });
+  if (tabVisible('ai')) renderMaskStatus();
   if ($('#curve')) drawCurve();
-  if (E.tab === 'basic') histSoon();
+  if (tabVisible('basic')) histSoon();
+}
+// 浮動面板：拖曳標題移動，靠近螢幕邊緣或右側面板會自動貼齊；拖到分頁列上就貼回
+function bindFloatPanels() {
+  let drag = null;
+  document.addEventListener('pointerdown', (e) => {
+    const h = e.target.closest('.fhead'); if (!h || e.target.closest('.fb')) return;
+    const p = h.parentElement; const r = p.getBoundingClientRect(); drag = { el: p, t: h.dataset.drag, dx: e.clientX - r.left, dy: e.clientY - r.top }; h.setPointerCapture(e.pointerId); e.preventDefault();
+  });
+  document.addEventListener('pointermove', (e) => {
+    if (!drag) return; const W = innerWidth, H = innerHeight, el = drag.el, w = el.offsetWidth, h = el.offsetHeight;
+    let x = e.clientX - drag.dx, y = e.clientY - drag.dy; const SN = 14;
+    const side = $('#tools').getBoundingClientRect();
+    if (Math.abs(x) < SN) x = 0; if (Math.abs(x + w - W) < SN) x = W - w; if (Math.abs(y - 46) < SN) y = 46; if (Math.abs(y + h - H) < SN) y = H - h;
+    if (Math.abs(x + w - side.left) < SN) x = side.left - w;           // 貼齊右側面板
+    x = Math.max(0, Math.min(W - 60, x)); y = Math.max(0, Math.min(H - 30, y));
+    el.style.left = x + 'px'; el.style.top = y + 'px';
+    const tb = document.querySelector('#tools .ttabs')?.getBoundingClientRect(); el.classList.toggle('docking', !!tb && e.clientX > tb.left && e.clientX < tb.right && e.clientY > tb.top - 10 && e.clientY < tb.bottom + 10);
+  });
+  document.addEventListener('pointerup', (e) => {
+    if (!drag) return; const el = drag.el; const t = drag.t; drag = null;
+    if (el.classList.contains('docking')) { setPanelState(t, { mode: 'dock' }); E.tab = t; renderTools(); return; }
+    setPanelState(t, { x: parseInt(el.style.left), y: parseInt(el.style.top), w: el.offsetWidth });
+  });
 }
 function renderMaskStatus() {
   const el = $('#maskStatus'); if (!el) return;
@@ -828,33 +914,39 @@ function refocusHTML() {
   <div class="hint">${E.masks ? (E.masks.hasDepth ? (e.focus ? '已設定焦點' : '尚未選擇焦點') : '深度估計失敗，無法使用') : 'AI 分析深度中…'}</div></div>`;
 }
 function healToolsHTML() {
-  const ops = E.edits.heal || [];
-  return `<div class="sec"><div class="t"><span>移除物件 / 電線 <span class="ai">AI</span></span></div>
-  <div class="hint" style="margin-bottom:6px">開啟筆刷後，在畫面上塗抹想移除的東西（路人、垃圾、電線、痘痘以外的瑕疵），放開滑鼠會自動補上周圍的紋理。</div>
-  <div style="display:flex;gap:6px;margin-bottom:6px"><div class="btn sm ${E.healMode ? 'on' : 'p'}" data-act="healToggle">${E.healMode ? '✓ 完成塗抹' : '🖌 筆刷移除物件'}</div><div class="btn sm" data-act="autoLines">✦ 自動偵測電線</div></div>
-  <div class="sl"><label>筆刷大小</label><input type="range" id="healR" min="0.004" max="0.08" step="0.001" value="${E.healR}"><em id="healRv">${Math.round(E.healR * 1000)}</em></div>
-  ${ops.length ? ops.map((o, i) => `<div class="item"><span class="nm">${o.rle ? '電線 / 細線' : '筆刷移除'} #${i + 1}</span><span class="x" data-delheal="${i}" style="cursor:pointer">刪除</span></div>`).join('') : '<div class="hint">還沒有修補</div>'}
+  const ops = E.edits.heal || []; const md = E.healTool || 'remove';
+  const nm = { remove: '移除物件', heal: '修復筆刷', clone: '仿製印章' };
+  return `<div class="sec"><div class="t"><span>移除 / 修復 / 仿製印章 <span class="ai">AI</span></span></div>
+  <div class="chips" style="margin-bottom:6px">${[['remove', '✦ 內容感知移除'], ['heal', '🩹 修復筆刷'], ['clone', '⎘ 仿製印章']].map(([k, l]) => `<span class="chip ${md === k ? 'on' : ''}" data-healtool="${k}">${l}</span>`).join('')}</div>
+  <div class="hint" style="margin-bottom:6px">${md === 'remove' ? '塗抹想移除的東西（路人、垃圾、電線、瑕疵），放開後 AI 依周圍紋理自動補上。' : md === 'heal' ? '修復筆刷：在瑕疵上塗抹，會自動找附近相似的紋理覆蓋，並讓顏色、亮度與周圍融合；按住 Alt 點一下可以自己指定取樣點。' : '仿製印章：先按住 Alt 在照片上點一下設定取樣點，再到要覆蓋的地方塗抹，會原樣複製取樣處的像素。'}${E.cloneSrc && md !== 'remove' ? '<br>✓ 已設定取樣點' : ''}</div>
+  ${md === 'remove' ? `<div class="chips" style="margin-bottom:6px"><span class="chip ${E.healDetect !== false ? 'on' : ''}" data-act="healDetect">${E.healDetect !== false ? '✓ ' : ''}偵測物件（大略塗刷即可，自動抓整個物件）</span></div>` : ''}
+  <div style="display:flex;gap:6px;margin-bottom:6px"><div class="btn sm ${E.healMode ? 'on' : 'p'}" data-act="healToggle">${E.healMode ? '✓ 完成' : '🖌 開始塗抹'}</div><div class="btn sm" data-act="autoLines">✦ 自動偵測電線</div></div>
+  <div class="sl"><label>筆刷大小</label><input type="range" id="healR" min="0.002" max="0.08" step="0.001" value="${E.healR}"><em id="healRv">${Math.round(E.healR * 1000)}</em></div>
+  ${ops.length ? ops.map((o, i) => `<div class="item"><span class="nm">${o.rle ? '電線 / 細線' : o.mode === 'eyes' ? '閉眼修復' : nm[o.mode || 'remove']} #${i + 1}</span><span class="x" data-delheal="${i}" style="cursor:pointer">刪除</span></div>`).join('') : '<div class="hint">還沒有修補</div>'}
   </div>`;
 }
 const LAYER_SL = [['exp', '曝光'], ['con', '對比'], ['hl', '亮部'], ['sh', '暗部'], ['sat', '飽和度'], ['temp', '色溫'], ['tint', '色調'], ['clar', '清晰度'], ['dehaze', '去朦朧'], ['sharp', '銳利 / 柔化']];
-const LAYER_BASE = [['none', '純筆刷'], ['all', '整張'], ['person', '人物'], ['bg', '背景'], ['sky', '天空'], ['skin', '皮膚'], ['hair', '頭髮'], ['face', '臉部'], ['water', '水面'], ['plants', '植物']];
+const LAYER_BASE = [['none', '純筆刷'], ['linear', '線性漸層'], ['radial', '放射漸層（圓形 / 橢圓）'], ['all', '整張'], ['person', '人物'], ['bg', '背景'], ['sky', '天空'], ['skin', '皮膚'], ['hair', '頭髮'], ['face', '臉部'], ['water', '水面'], ['plants', '植物']];
 function layerName(l) { return l.name || ((LAYER_BASE.find(m => m[0] === l.mask) || [, '圖層'])[1] + (l.mask === 'none' ? '' : ' 範圍')); }
 function localToolsHTML() {
   const L = E.edits.local || []; if (E.layerSel == null || E.layerSel >= L.length) E.layerSel = L.length - 1;
   const cur = L[E.layerSel]; const B = E.brush;
   let h = `<div class="sec"><div class="t"><span>圖層（筆刷 ＋ AI 範圍）<span class="ai">AI</span></span></div>
   <div class="hint" style="margin-bottom:6px">每個圖層有自己的範圍與調整。可以只用筆刷塗出範圍，也可以從 AI 範圍（人物、天空…）開始，再用筆刷增加或擦掉（最多 8 層）。</div>
-  <div style="display:flex;gap:6px;flex-wrap:wrap"><div class="btn sm p" data-act="layerAddBrush">＋ 筆刷圖層</div><div class="btn sm" data-act="dodge">☀ 加亮筆刷</div><div class="btn sm" data-act="burn">◐ 加深筆刷</div><select id="layerAddAI" class="btn sm" style="padding:3px 6px"><option value="">＋ AI 範圍圖層…</option>${LAYER_BASE.slice(1).map(([k, n]) => `<option value="${k}">${n}</option>`).join('')}</select></div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap"><div class="btn sm p" data-act="layerAddBrush">＋ 筆刷圖層</div><div class="btn sm" data-act="gradLinear">▤ 線性漸層</div><div class="btn sm" data-act="gradRadial">◯ 放射漸層</div><div class="btn sm" data-act="dodge">☀ 加亮筆刷</div><div class="btn sm" data-act="burn">◐ 加深筆刷</div><select id="layerAddAI" class="btn sm" style="padding:3px 6px"><option value="">＋ AI 範圍圖層…</option>${LAYER_BASE.slice(1).map(([k, n]) => `<option value="${k}">${n}</option>`).join('')}</select></div>
   <div class="layers">${L.map((l, i) => `<div class="layer ${i === E.layerSel ? 'on' : ''}" data-lsel="${i}"><span class="eye" data-leye="${i}" title="顯示 / 隱藏">${l.on === false ? '◌' : '●'}</span><span class="nm">${esc(layerName(l))}</span><span class="cnt">${(l.strokes || []).length ? '🖌' + l.strokes.length : ''}</span><span class="x" data-dellocal="${i}" title="刪除圖層">✕</span></div>`).reverse().join('') || '<div class="hint">還沒有圖層</div>'}</div></div>`;
   if (cur) {
     h += `<div class="sec"><div class="t"><span>${esc(layerName(cur))}</span><span class="tx"><span class="x" data-act="layerRename">改名</span></span></div>
     <div class="sl"><label>範圍</label><select id="layerBase" style="flex:1">${LAYER_BASE.map(([k, n]) => `<option value="${k}" ${cur.mask === k ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
-    <div class="chips" style="margin:6px 0"><span class="chip ${E.brushMode && !B.erase ? 'on' : ''}" data-act="brushPaint">🖌 筆刷</span><span class="chip ${E.brushMode && B.erase ? 'on' : ''}" data-act="brushErase">⌫ 橡皮擦</span><span class="chip ${cur.inv ? 'on' : ''}" data-act="layerInv">反轉範圍</span><span class="chip ${E.showMask ? 'on' : ''}" data-act="layerShow">顯示範圍</span><span class="chip" data-act="layerClear">清除筆畫</span></div>
+    <div class="chips" style="margin:6px 0"><span class="chip ${E.brushMode && E.brushTarget === 'layer' && !B.erase ? 'on' : ''}" data-act="brushPaint">🖌 筆刷</span><span class="chip ${E.brushMode && E.brushTarget === 'layer' && B.erase ? 'on' : ''}" data-act="brushErase">⌫ 橡皮擦</span><span class="chip ${cur.inv ? 'on' : ''}" data-act="layerInv">反轉範圍</span><span class="chip ${E.showMask ? 'on' : ''}" data-act="layerShow">顯示範圍</span><span class="chip" data-act="layerClear">清除筆畫</span></div>
     <div class="sl"><label>筆刷大小</label><input type="range" id="brSize" min="2" max="300" value="${Math.round(B.size * 1000)}"><em id="brSizeV">${Math.round(B.size * 1000)}</em></div>
     <div class="sl"><label>羽化</label><input type="range" id="brFeather" min="0" max="100" value="${Math.round(B.f * 100)}"><em>${Math.round(B.f * 100)}</em></div>
     <div class="sl"><label>流量</label><input type="range" id="brFlow" min="5" max="100" value="${Math.round(B.flow * 100)}"><em>${Math.round(B.flow * 100)}</em></div>
     <div class="hint">開啟筆刷後直接在照片上塗抹（可先放大畫面細修）；[ ] 鍵調整筆刷大小，按住 Alt 暫時切換橡皮擦。</div>
-    <div class="sl" style="margin-top:6px"><label>圖層強度</label><input type="range" data-lk="amt" data-li="${E.layerSel}" min="0" max="100" value="${cur.amt ?? 100}"><em>${cur.amt ?? 100}</em></div>
+    ${cur.mask === 'radial' ? `<div class="sl"><label>羽化</label><input type="range" data-lgeo="f" min="0" max="100" value="${cur.geo?.f ?? 50}"><em>${cur.geo?.f ?? 50}</em></div><div class="sl"><label>旋轉</label><input type="range" data-lgeo="rot" min="-180" max="180" value="${Math.round((cur.geo?.rot || 0) * 180 / Math.PI)}"><em>${Math.round((cur.geo?.rot || 0) * 180 / Math.PI)}°</em></div>` : ''}
+    ${cur.mask === 'linear' || cur.mask === 'radial' ? '<div class="hint">在照片上拖曳控制點調整漸層位置、大小與方向。</div>' : ''}
+    <div class="sl"><label>顏色</label><input type="color" data-ltint="c" value="${cur.tintC || '#ffa040'}" style="width:34px;height:22px;border:0;background:none;padding:0"><input type="range" data-lk="tintA" data-li="${E.layerSel}" min="0" max="100" value="${cur.tintA || 0}"><em>${cur.tintA || 0}</em></div>
+    <div class="sl" style="margin-top:6px"><label>透明度</label><input type="range" data-lk="amt" data-li="${E.layerSel}" min="0" max="100" value="${cur.amt ?? 100}"><em>${cur.amt ?? 100}</em></div>
     ${LAYER_SL.map(([k, n]) => `<div class="sl"><label>${n}</label><input type="range" class="${cur[k] ? 'ch' : ''}" data-lk="${k}" data-li="${E.layerSel}" min="-100" max="100" value="${cur[k] || 0}"><em>${cur[k] > 0 ? '+' : ''}${cur[k] || 0}</em></div>`).join('')}
     </div>`;
   }
@@ -1024,16 +1116,151 @@ function bindSplit() {
   $('#splitLine').addEventListener('pointerup', () => d = false);
 }
 
+// ── 鏡頭描述檔（lensfun 開源資料庫，含 1400+ 顆鏡頭的變形、色差、暗角校正資料）──
+let lensDB = null; fetch('app://bundle/models/lensfun.json').then(r => r.json()).then(j => { lensDB = j; j.lenses.forEach(l => l.key = normLens(l.maker + ' ' + l.model)); if (S.view === 'edit') renderTools(); }).catch(() => {});
+function normLens(t) { return (t || '').toLowerCase().replace(/f\/?\s*/g, 'f').replace(/[^a-z0-9.\-]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+function lensScore(l, q, focal) {
+  const qt = normLens(q).split(' ').filter(Boolean); if (!qt.length) return 0; let sc = 0; for (const t of qt) if (l.key.includes(t)) sc += t.length > 2 ? 2 : 1;
+  const rng = (l.model.match(/(\d+)(?:-(\d+))?\s*mm/i)); if (rng && focal) { const a = +rng[1], b = +(rng[2] || rng[1]); if (focal < a - 0.6 || focal > b + 0.6) sc -= 5; }
+  const qr = (q || '').match(/(\d+)(?:-(\d+))?\s*mm/i); if (qr && rng && qr[1] === rng[1] && (qr[2] || '') === (rng[2] || '')) sc += 6; return sc;
+}
+function lensSearch(q) { if (!lensDB) return []; const f = E.photo?.info?.focal; return lensDB.lenses.map(l => [lensScore(l, q, f), l]).filter(a => a[0] > 0).sort((a, b) => b[0] - a[0]).slice(0, 30).map(a => a[1]); }
+function lensMatch() {
+  if (!lensDB || !E.photo) return null; const name = E.edits.lensName; if (name) return lensDB.lenses.find(l => (l.maker + ' ' + l.model) === name) || null;
+  const q = E.photo.info?.lens; if (!q) return null; const r = lensSearch(q)[0]; return r && lensScore(r, q, E.photo.info?.focal) >= 6 ? r : null;
+}
+function lensParams(l, info) {
+  const f = info?.focal || 50, ap = info?.fnum || 8;
+  const pick = (arr) => { if (!arr.length) return null; const s = [...arr].sort((a, b) => a[0] - b[0]); let lo = s[0], hi = s[s.length - 1]; for (const r of s) { if (r[0] <= f) lo = r; if (r[0] >= f) { hi = r; break; } } const t = hi[0] === lo[0] ? 0 : (f - lo[0]) / (hi[0] - lo[0]); return lo.map((v, i) => typeof v === 'number' && typeof hi[i] === 'number' ? v + (hi[i] - v) * t : v); };
+  const d = pick(l.dist), tc = pick(l.tca);
+  let vg = null; if (l.vig.length) { const fs = [...new Set(l.vig.map(v => v[0]))]; const nf = fs.reduce((a, b) => Math.abs(b - f) < Math.abs(a - f) ? b : a); const cand = l.vig.filter(v => v[0] === nf); vg = cand.reduce((a, b) => Math.abs(b[1] - ap) < Math.abs(a[1] - ap) ? b : a); }
+  const cam = lensDB.cams.find(c => info?.model && c.model.toLowerCase() === String(info.model).toLowerCase()); const camCrop = cam?.crop || l.crop;
+  const P = { s: l.crop / camCrop, fix: 1 };
+  if (d) { P.dist = 1; P.m = d[1] === 'poly3' ? 1 : d[1] === 'poly5' ? 2 : 3; P.a = d[2]; P.b = d[3]; P.c = d[4]; P.k1 = d[5]; P.k2 = d[6];
+    // 角落取樣超出畫面時自動放大，避免黑邊
+    const W = engine.srcW, H = engine.srcH; const ru = Math.hypot(W, H) / Math.min(W, H) * P.s; const rd = P.m === 1 ? ru * (1 - P.k1 + P.k1 * ru * ru) : P.m === 2 ? ru * (1 + P.k1 * ru * ru + P.k2 * ru ** 4) : ru * (P.a * ru ** 3 + P.b * ru * ru + P.c * ru + 1 - P.a - P.b - P.c); P.fix = Math.max(1, rd / ru); }
+  if (tc) { P.tca = 1; P.kr = tc[1]; P.kb = tc[2]; }
+  if (vg) { P.vig = 1; P.v1 = vg[2]; P.v2 = vg[3]; P.v3 = vg[4]; }
+  return P;
+}
+function applyLensProfile(on) { const m = lensMatch(); if (on && !m) { toast('找不到這顆鏡頭的描述檔，請在「選擇鏡頭」輸入型號'); setEdit({ lensProf: false }); renderTools(); return; } setEdit({ lensProf: on, lensP: on ? lensParams(m, E.photo.info) : null }, { label: on ? '鏡頭描述檔：' + m.model : '關閉鏡頭描述檔' }); renderTools(); }
+
+// ── 自動拉正（Upright）：找畫面中接近垂直的邊緣，回歸「邊緣傾角 vs 水平位置」，常數項＝整體傾斜、斜率＝透視收斂 ──
+function verticalStats(img) {
+  const W = img.width, H = img.height, d = img.data; const g = new Float32Array(W * H); for (let i = 0; i < W * H; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  let sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x;
+    const gx = (g[i - W + 1] + 2 * g[i + 1] + g[i + W + 1]) - (g[i - W - 1] + 2 * g[i - 1] + g[i + W - 1]), gy = (g[i + W - 1] + 2 * g[i + W] + g[i + W + 1]) - (g[i - W - 1] + 2 * g[i - W] + g[i - W + 1]);
+    const m = Math.hypot(gx, gy); if (m < 60) continue; const phi = Math.atan2(gy, gx); // 垂直邊緣：梯度接近水平
+    let dv = phi; if (dv > Math.PI / 2) dv -= Math.PI; if (dv < -Math.PI / 2) dv += Math.PI; if (Math.abs(dv) > 0.3) continue;
+    const xn = x / W - 0.5; const w = m * (1 - Math.abs(dv) / 0.3); sw += w; sx += w * xn; sy += w * dv; sxx += w * xn * xn; sxy += w * xn * dv; }
+  if (sw < 1e3) return null; const b = (sw * sxy - sx * sy) / (sw * sxx - sx * sx + 1e-9), a = (sy - b * sx) / sw; return { a, b };
+}
+async function autoUpright() {
+  setBusy('偵測直線中…'); await sleep(20);
+  const w = 480, h = Math.round(480 * engine.srcH / engine.srcW); const base = { ...DEFAULT_EDITS(), crop: E.edits.crop, lensProf: E.edits.lensProf, lensP: E.edits.lensP };
+  const m0 = verticalStats(engine.renderPixels(base, w, h)); if (!m0) { setBusy(null); toast('畫面中沒有足夠的直線可以判斷'); return; }
+  let best = { v: 0, e: Math.abs(m0.b) };
+  for (const v of [-80, -60, -40, -25, -12, 12, 25, 40, 60, 80]) { const m = verticalStats(engine.renderPixels({ ...base, geoV: v }, w, h)); if (m && Math.abs(m.b) < best.e) best = { v, e: Math.abs(m.b) }; }
+  for (const dv of [-6, -3, 3, 6]) { const v = best.v + dv; const m = verticalStats(engine.renderPixels({ ...base, geoV: v }, w, h)); if (m && Math.abs(m.b) < best.e) best = { v, e: Math.abs(m.b) }; }
+  const m1 = verticalStats(engine.renderPixels({ ...base, geoV: best.v }, w, h)); const tilt = m1 ? m1.a * 180 / Math.PI : 0;
+  const c = E.edits.crop; const ang = Math.max(-45, Math.min(45, (c.angle || 0) - tilt));
+  setEdit({ geoV: best.v, crop: cropForAngle({ ...c }, ang) }, { label: '自動拉正' }); renderTools(); setBusy(null); toast(`已自動拉正：垂直透視 ${best.v}、傾斜 ${tilt.toFixed(1)}°`);
+}
+
+// ── AI 暗部提亮：從目前照片（只含白平衡與曝光）算出增益圖 ──
+async function computeLowGain() {
+  if (!engine?.srcTex || E._lowBusy) return; E._lowBusy = true; setBusy('AI 暗部提亮分析中…');
+  try { const w = Math.min(512, engine.srcW), h = Math.round(w * engine.srcH / engine.srcW); const img = engine.renderPixels({ ...DEFAULT_EDITS(), temp: E.edits.temp, tint: E.edits.tint, exposure: E.edits.exposure }, w, h); engine.setLowGain(await lowLightGain(img)); draw(); } catch (err) { toast('AI 暗部提亮失敗：' + err.message); }
+  E._lowBusy = false; setBusy(null);
+}
+async function runFivek() {
+  setBusy('AI 專業調色分析中…');
+  try { const w = 256, h = Math.round(256 * engine.srcH / engine.srcW); const img = engine.renderPixels({ ...E.edits, fivekAmt: 0, lutAmt: 0, film: E.edits.film }, w, h); const wt = await fivekWeights(img); setEdit({ fivekW: wt, fivekAmt: E.edits.fivekAmt || 80 }, { label: 'AI 專業調色' }); renderTools(); } catch (err) { toast('AI 專業調色失敗：' + err.message); }
+  setBusy(null);
+}
+
+// ── AI 範圍檢視與筆刷修正：每個 AI 偵測的範圍都可以顯示出來，再用筆刷增加或擦掉 ──
+const MASK_CH = [['skin', '皮膚', 'm1', 0], ['face', '臉部輪廓', 'm3', 2], ['eyes', '眼睛', 'm1', 3], ['underEye', '黑眼圈', 'm1', 1], ['teeth', '牙齒', 'm1', 2], ['lips', '嘴唇', 'm3', 0], ['brows', '眉毛', 'm3', 1], ['blush', '腮紅位置', 'm3', 3], ['hair', '頭髮', 'm4', 0], ['person', '人物 / 身體', 'm2', 0], ['sky', '天空', 'm2', 1], ['water', '水面', 'm4', 1]];
+function applyMaskFix(m, fix, live) {
+  if (!m) return m; const keys = Object.keys(fix || {}).filter(k => (fix[k] || []).length);
+  if (!keys.length && !live) return m;
+  const out = { ...m }; const copied = {};
+  const todo = new Map(keys.map(k => [k, [...fix[k]]])); if (live) todo.set(live.key, [...(todo.get(live.key) || []), live.stroke]);
+  for (const [k, strokes] of todo) {
+    const ch = MASK_CH.find(c => c[0] === k); if (!ch || !m[ch[2]]) continue; const tex = ch[2], c = ch[3];
+    if (!copied[tex]) { out[tex] = new Uint8Array(m[tex]); copied[tex] = 1; }
+    const r = rasterStrokes(strokes, m.w, m.h); const a = out[tex];
+    for (let i = 0; i < m.w * m.h; i++) { const dv = r[i * 4] - 128; if (dv) a[i * 4 + c] = Math.max(0, Math.min(255, a[i * 4 + c] + dv * 2)); }
+  }
+  return out;
+}
+function maskFixHTML() {
+  const sel = E.maskSel || 'skin'; const n = (E.edits.maskFix?.[sel] || []).length; const on = E.brushMode && E.brushTarget === 'mask'; const B = E.brush;
+  return `<div class="sec"><div class="t"><span>AI 範圍檢視 / 筆刷修正 <span class="ai">AI</span></span>${Object.values(E.edits.maskFix || {}).some(v => v.length) ? '<span class="rst" data-act="maskFixReset">↺ 重設</span>' : ''}</div>
+  <div class="chips" style="margin-bottom:6px">${MASK_CH.map(([k, l]) => `<span class="chip ${sel === k ? 'on' : ''}" data-masksel="${k}">${l}${(E.edits.maskFix?.[k] || []).length ? ' ✎' : ''}</span>`).join('')}</div>
+  <div class="chips"><span class="chip ${E.maskShow ? 'on' : ''}" data-act="maskShow">👁 顯示範圍</span><span class="chip ${on && !B.erase ? 'on' : ''}" data-act="maskAdd">🖌 增加範圍</span><span class="chip ${on && B.erase ? 'on' : ''}" data-act="maskSub">⌫ 減少範圍</span>${n ? `<span class="chip" data-act="maskClear">清除這個範圍的筆畫（${n}）</span>` : ''}</div>
+  ${on ? `<div class="sl" style="margin-top:6px"><label>筆刷大小</label><input type="range" id="brSize" min="2" max="300" value="${Math.round(B.size * 1000)}"><em id="brSizeV">${Math.round(B.size * 1000)}</em></div><div class="sl"><label>羽化</label><input type="range" id="brFeather" min="0" max="100" value="${Math.round(B.f * 100)}"><em>${Math.round(B.f * 100)}</em></div>` : ''}
+  <div class="hint">選一個範圍、開啟「顯示範圍」看 AI 偵測到哪裡（紅色），再用筆刷補上漏掉或擦掉多抓的地方；所有使用這個範圍的功能（磨皮、美白、換髮色、瘦身、天空…）都會跟著修正。滾輪可調筆刷大小。</div></div>`;
+}
+
+// ── 漸層控制點（線性：起點、終點；放射：中心、左右上下半徑）──
+function srcToScreen(pt) { const r = $('#cv').getBoundingClientRect(), vr = $('#viewer').getBoundingClientRect(); const o = engine.srcToOut(pt, E.edits.crop, E.view || [.5, .5, 1, 1]); return [r.left - vr.left + o[0] * r.width, r.top - vr.top + o[1] * r.height]; }
+function positionGrad() {
+  let g = $('#gradOv'); const l = (E.edits?.local || [])[E.layerSel];
+  const show = S.view === 'edit' && l && (l.mask === 'linear' || l.mask === 'radial') && tabVisible('layers') && engine?.srcTex && !E.crop;
+  if (!g) { g = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); g.id = 'gradOv'; $('#viewer').appendChild(g); }
+  if (!show) { g.style.display = 'none'; return; } g.style.display = 'block'; const q = l.geo || {};
+  if (l.mask === 'linear') {
+    const a = srcToScreen({ x: q.x0, y: q.y0 }), b = srcToScreen({ x: q.x1, y: q.y1 }); const dx = b[0] - a[0], dy = b[1] - a[1]; const len = Math.hypot(dx, dy) || 1; const nx = -dy / len * 2000, ny = dx / len * 2000; const m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const ln = (p, d) => `<line x1="${p[0] - nx}" y1="${p[1] - ny}" x2="${p[0] + nx}" y2="${p[1] + ny}" stroke="#fff" stroke-width="1.2" ${d ? 'stroke-dasharray="6 5"' : ''} opacity=".9"/>`;
+    g.innerHTML = ln(a, 0) + ln(m, 1) + ln(b, 0) + `<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="#e0874a" stroke-width="1.5"/>` + [['p0', a], ['p1', b], ['mid', m]].map(([k, p]) => `<circle data-gh="${k}" cx="${p[0]}" cy="${p[1]}" r="${k === 'mid' ? 8 : 7}" fill="${k === 'mid' ? '#e0874a' : '#fff'}" stroke="#000" stroke-width="1.2"/>`).join('');
+  } else {
+    const c = srcToScreen({ x: q.cx, y: q.cy }); const r = $('#cv').getBoundingClientRect(); const sc = r.width / (E.edits.crop.w * engine.srcW * (E.view?.[2] || 1));
+    const rx = q.rx * engine.srcW * sc, ry = q.ry * engine.srcH * sc, deg = (q.rot || 0) * 180 / Math.PI - (E.edits.crop.angle || 0); const rad = deg * Math.PI / 180;
+    const pt = (u, v) => [c[0] + Math.cos(rad) * u - Math.sin(rad) * v, c[1] + Math.sin(rad) * u + Math.cos(rad) * v]; const fe = (q.f ?? 50) / 100;
+    g.innerHTML = `<ellipse cx="${c[0]}" cy="${c[1]}" rx="${rx}" ry="${ry}" transform="rotate(${deg} ${c[0]} ${c[1]})" fill="none" stroke="#fff" stroke-width="1.4"/><ellipse cx="${c[0]}" cy="${c[1]}" rx="${rx * (1 - fe)}" ry="${ry * (1 - fe)}" transform="rotate(${deg} ${c[0]} ${c[1]})" fill="none" stroke="#fff" stroke-dasharray="5 5" opacity=".7"/>` +
+      [['c', c], ['rx', pt(rx, 0)], ['rx2', pt(-rx, 0)], ['ry', pt(0, ry)], ['ry2', pt(0, -ry)]].map(([k, p]) => `<circle data-gh="${k}" cx="${p[0]}" cy="${p[1]}" r="${k === 'c' ? 8 : 6}" fill="${k === 'c' ? '#e0874a' : '#fff'}" stroke="#000" stroke-width="1.2"/>`).join('');
+  }
+}
+function bindWheels() {
+  let wd = null;
+  const upd = (e) => { const r = wd.el.getBoundingClientRect(); const dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2); const rr = Math.min(1, Math.hypot(dx, dy) / (r.width / 2)); let h = Math.atan2(dx, -dy) * 180 / Math.PI; if (h < 0) h += 360;
+    if (wd.ring) { const P = clone(E.edits.pointColors || []); if (wd.add) { if (P.length >= 4) P.shift(); P.push({ h: Math.round(h), range: 30, dh: 0, ds: 0, dl: 0 }); E.pcSel = P.length - 1; wd.add = false; } else if (P[E.pcSel ?? 0]) P[E.pcSel ?? 0].h = Math.round(h); setEdit({ pointColors: P }, { label: '點顏色' }); }
+    else setEdit({ ['cg' + wd.k + 'h']: Math.round(h), ['cg' + wd.k + 's']: Math.round(rr * 100) }, { label: '色彩分級' });
+    const i = wd.el.querySelector('i'); if (i && !wd.ring) { i.style.left = 50 + rr * 50 * Math.sin(h * Math.PI / 180) + '%'; i.style.top = 50 - rr * 50 * Math.cos(h * Math.PI / 180) + '%'; wd.el.nextElementSibling.textContent = `色相 ${Math.round(h)}° · 飽和 ${Math.round(rr * 100)}`; } };
+  document.addEventListener('pointerdown', (e) => { const w = e.target.closest && e.target.closest('[data-wheel],[data-ring]'); if (!w) return; e.preventDefault(); wd = { el: w, k: w.dataset.wheel, ring: !!w.dataset.ring, add: !!w.dataset.ring && !(e.target.tagName === 'I') && !(E.edits.pointColors || []).length || (!!w.dataset.ring && e.shiftKey) }; w.setPointerCapture(e.pointerId); upd(e); });
+  document.addEventListener('pointermove', (e) => { if (wd) upd(e); });
+  document.addEventListener('pointerup', () => { if (wd) { wd = null; renderTools(); } });
+  document.addEventListener('dblclick', (e) => { const w = e.target.closest && e.target.closest('[data-wheel]'); if (!w) return; const k = w.dataset.wheel; setEdit({ ['cg' + k + 'h']: 0, ['cg' + k + 's']: 0 }, { label: '色彩分級歸零' }); renderTools(); });
+}
+function bindGrad() {
+  let st = null;
+  document.addEventListener('pointerdown', (e) => {
+    const h = e.target.closest && e.target.closest('#gradOv [data-gh]'); if (!h) return; e.preventDefault(); e.stopPropagation();
+    st = { k: h.dataset.gh, p0: screenToSrc(e), geo: clone(E.edits.local[E.layerSel].geo || {}), before: clone(E.edits.local) }; h.setPointerCapture?.(e.pointerId);
+  }, true);
+  document.addEventListener('pointermove', (e) => {
+    if (!st) return; const p = screenToSrc(e); const dx = p[0] - st.p0[0], dy = p[1] - st.p0[1]; const g = { ...st.geo }; const L = E.edits.local; const l = L[E.layerSel];
+    if (l.mask === 'linear') { if (st.k === 'p0' || st.k === 'mid') { g.x0 += dx; g.y0 += dy; } if (st.k === 'p1' || st.k === 'mid') { g.x1 += dx; g.y1 += dy; } }
+    else { if (st.k === 'c') { g.cx += dx; g.cy += dy; } else { const W = engine.srcW, H = engine.srcH; const vx = (p[0] - g.cx) * W, vy = (p[1] - g.cy) * H; const ro = g.rot || 0; const u = Math.cos(ro) * vx + Math.sin(ro) * vy, v = -Math.sin(ro) * vx + Math.cos(ro) * vy;
+      if (st.k.startsWith('rx')) { g.rx = Math.max(0.005, Math.abs(u) / W); if (e.shiftKey) g.ry = g.rx * W / H; } else { g.ry = Math.max(0.005, Math.abs(v) / H); if (e.shiftKey) g.rx = g.ry * H / W; }
+      if (e.altKey && st.k.startsWith('rx')) g.rot = Math.atan2(vy, vx) - (st.k === 'rx2' ? Math.PI : 0); } }
+    l.geo = g; engine.dirty = true; draw(); positionGrad();
+  });
+  document.addEventListener('pointerup', () => { if (!st) return; const L = clone(E.edits.local); E.edits.local = st.before; st = null; setEdit({ local: L }, { label: '調整漸層' }); positionGrad(); });
+}
+
 // ── 圖層筆刷 ──
 function addLayer(mask) {
   const L = [...(E.edits.local || [])]; if (L.length >= 8) { toast('最多 8 個圖層'); renderTools(); return; }
   L.push({ mask, strokes: [], exp: 0, con: 0, hl: 0, sh: 0, sat: 0, temp: 0, tint: 0, clar: 0, dehaze: 0, sharp: 0, amt: 100 });
   E.layerSel = L.length - 1; setEdit({ local: L }, { label: '新增圖層' });
-  if (mask === 'none') { E.brush.erase = false; setBrushMode(true); }
+  if (mask === 'none') { E.brush.erase = false; setBrushMode(true, 'layer'); }
   renderTools(); draw();
 }
-function setBrushMode(on) {
-  E.brushMode = on && (E.edits.local || []).length > 0; if (E.brushMode) { E.healMode = false; E.focusMode = false; if (E.crop) { E.crop = false; layoutCanvas(); } }
+function setBrushMode(on, target = 'layer') {
+  E.brushTarget = target; E.brushMode = on && (target === 'mask' || (E.edits.local || []).length > 0); if (E.brushMode) { E.healMode = false; E.focusMode = false; if (E.crop) { E.crop = false; layoutCanvas(); } }
   $('#cv').classList.toggle('brushing', E.brushMode); let c = $('#brushCur'); if (!c) { c = document.createElement('div'); c.id = 'brushCur'; $('#viewer').appendChild(c); } c.classList.toggle('hidden', !E.brushMode);
 }
 // 畫面座標 → 來源 0..1（含裁切、旋轉、縮放）
@@ -1053,17 +1280,22 @@ function updBrushCursor(ev) {
 }
 let brushSt = null;
 function brushDown(ev) {
-  const L = E.edits.local || []; const l = L[E.layerSel]; if (!l) return;
   brushSt = { pts: [screenToSrc(ev)], r: E.brush.size, f: E.brush.f, flow: E.brush.flow, erase: E.brush.erase !== ev.altKey };
-  engine.liveBrush = { layer: l, stroke: brushSt, key: 'live' + Math.random() }; $('#cv').setPointerCapture(ev.pointerId); draw();
+  $('#cv').setPointerCapture(ev.pointerId);
+  if (E.brushTarget === 'mask') { liveMask(); return; }
+  const L = E.edits.local || []; const l = L[E.layerSel]; if (!l) { brushSt = null; return; }
+  engine.liveBrush = { layer: l, stroke: brushSt, key: 'live' + Math.random() }; draw();
 }
+let liveMaskRaf = 0;
+function liveMask() { if (liveMaskRaf) return; liveMaskRaf = requestAnimationFrame(() => { liveMaskRaf = 0; if (!brushSt || !E.masks) return; engine.setMasks(applyMaskFix(E.masks, E.edits.maskFix, { key: E.maskSel || 'skin', stroke: brushSt })); draw(); }); }
 function brushMove(ev) {
   updBrushCursor(ev); if (!brushSt) return; const p = screenToSrc(ev); const q = brushSt.pts[brushSt.pts.length - 1];
   const L = Math.max(engine.srcW, engine.srcH); if (Math.hypot((p[0] - q[0]) * engine.srcW, (p[1] - q[1]) * engine.srcH) < brushSt.r * L * 0.15) return;
-  brushSt.pts.push(p); engine.liveBrush.key = 'live' + brushSt.pts.length; draw();
+  brushSt.pts.push(p); if (E.brushTarget === 'mask') { liveMask(); return; } engine.liveBrush.key = 'live' + brushSt.pts.length; draw();
 }
 function brushUp() {
   if (!brushSt) return; const st = { ...brushSt, pts: brushSt.pts.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]) }; brushSt = null; engine.liveBrush = null;
+  if (E.brushTarget === 'mask') { const k = E.maskSel || 'skin'; const F = clone(E.edits.maskFix || {}); F[k] = [...(F[k] || []), st]; setEdit({ maskFix: F }, { label: '修正 AI 範圍' }); renderTools(); return; }
   const L = clone(E.edits.local); const l = L[E.layerSel]; l.strokes = [...(l.strokes || []), st];
   setEdit({ local: L }, { label: st.erase ? '橡皮擦' : '筆刷' }); renderTools(); draw();
 }
@@ -1090,21 +1322,113 @@ function healCanvas() {
   o.width = Math.round(r.width); o.height = Math.round(r.height); return o;
 }
 function healPos(e) { const r = $('#cv').getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; }
-function healDown(e) { const o = healCanvas(); healStroke = { pts: [healPos(e)], r: E.healR }; $('#cv').setPointerCapture(e.pointerId); paintStroke(o); }
+function healDown(e) {
+  const md = E.healTool || 'remove';
+  if (md !== 'remove' && e.altKey) { E.cloneSrc = healPos(e); toast('已設定取樣點'); renderTools(); drawCloneSrc(); return; }
+  if (md === 'clone' && !E.cloneSrc) { toast('先按住 Alt 在照片上點一下，設定要複製的取樣點'); return; }
+  const o = healCanvas(); healStroke = { pts: [healPos(e)], r: E.healR }; $('#cv').setPointerCapture(e.pointerId); paintStroke(o);
+}
+function drawCloneSrc() { const o = healCanvas(); const x = o.getContext('2d'); x.clearRect(0, 0, o.width, o.height); if (!E.cloneSrc) return; const [u, v] = E.cloneSrc; x.strokeStyle = '#fff'; x.lineWidth = 2; x.beginPath(); x.arc(u * o.width, v * o.height, E.healR * o.height, 0, 7); x.moveTo(u * o.width - 8, v * o.height); x.lineTo(u * o.width + 8, v * o.height); x.moveTo(u * o.width, v * o.height - 8); x.lineTo(u * o.width, v * o.height + 8); x.stroke(); }
+// 修復筆刷自動找取樣點：在周圍 8 個方向比對外圈紋理，挑最像的
+function autoHealSource(st) {
+  const c = decodeCache.get(E.photo?.id); if (!c) return [st.r * 2.5, 0]; const src = c.src, W = src.width, H = src.height, ch = src.channels || 3, d = src.data;
+  const xs = st.pts.map(p => p[0] * W), ys = st.pts.map(p => p[1] * H); const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const rad = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) / 2 + st.r * H; const ring = [];
+  for (let a = 0; a < 24; a++) { const t = a / 24 * Math.PI * 2; ring.push([cx + Math.cos(t) * rad * 1.25, cy + Math.sin(t) * rad * 1.25]); }
+  const px = (x, y) => { const X = Math.max(0, Math.min(W - 1, Math.round(x))), Y = Math.max(0, Math.min(H - 1, Math.round(y))); const i = (Y * W + X) * ch; return [d[i], d[i + 1], d[i + 2]]; };
+  let best = null;
+  for (let k = 0; k < 16; k++) { const t = k / 16 * Math.PI * 2; for (const m of [2.3, 3.2]) { const ox = Math.cos(t) * rad * m, oy = Math.sin(t) * rad * m; if (cx + ox - rad < 0 || cy + oy - rad < 0 || cx + ox + rad > W || cy + oy + rad > H) continue;
+    let e = 0; for (const [x, y] of ring) { const a = px(x, y), b = px(x + ox, y + oy); e += (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2; } e *= (1 + m * 0.1); if (!best || e < best.e) best = { e, ox, oy }; } }
+  return best ? [best.ox / W, best.oy / H] : [st.r * 2.5 * H / W, 0];
+}
 function healMove(e) { if (!healStroke) return; healStroke.pts.push(healPos(e)); paintStroke($('#healOverlay')); }
 function paintStroke(o) { const x = o.getContext('2d'); x.clearRect(0, 0, o.width, o.height); x.strokeStyle = x.fillStyle = 'rgba(255,60,60,.5)'; x.lineCap = x.lineJoin = 'round'; x.lineWidth = healStroke.r * 2 * o.height; x.beginPath(); healStroke.pts.forEach(([a, b], i) => i ? x.lineTo(a * o.width, b * o.height) : x.moveTo(a * o.width, b * o.height)); if (healStroke.pts.length === 1) { x.arc(healStroke.pts[0][0] * o.width, healStroke.pts[0][1] * o.height, healStroke.r * o.height, 0, 7); x.fill(); } else x.stroke(); }
+// 偵測物件：在塗抹範圍附近用 U²-Net 找出顯著物件（含陰影），自動把遮罩擴大到整個物件
+async function detectObjectMask(st) {
+  const W = Math.min(1024, engine.srcW), H = Math.round(W * engine.srcH / engine.srcW);
+  const xs = st.pts.map(p => p[0]), ys = st.pts.map(p => p[1]); const r = st.r * H / W;
+  let x0 = Math.min(...xs) - r, x1 = Math.max(...xs) + r, y0 = Math.min(...ys) - st.r, y1 = Math.max(...ys) + st.r; const cw = x1 - x0, chh = y1 - y0;
+  x0 = Math.max(0, x0 - cw * 0.35); x1 = Math.min(1, x1 + cw * 0.35); y0 = Math.max(0, y0 - chh * 0.35); y1 = Math.min(1, y1 + chh * 0.35);
+  const full = engine.renderPixels({ ...DEFAULT_EDITS() }, W, H); const X0 = Math.floor(x0 * W), Y0 = Math.floor(y0 * H), CW = Math.max(8, Math.ceil((x1 - x0) * W)), CH = Math.max(8, Math.ceil((y1 - y0) * H));
+  const fc = new OffscreenCanvas(W, H); fc.getContext('2d').putImageData(full, 0, 0); const cc = new OffscreenCanvas(CW, CH); const cx = cc.getContext('2d', { willReadFrequently: true }); cx.drawImage(fc, X0, Y0, CW, CH, 0, 0, CW, CH);
+  const sal = await segPerson(cx.getImageData(0, 0, CW, CH), CW, CH);
+  // 筆畫遮罩（裁切座標）
+  const sm = new OffscreenCanvas(CW, CH); const sx = sm.getContext('2d', { willReadFrequently: true }); sx.strokeStyle = sx.fillStyle = '#fff'; sx.lineCap = sx.lineJoin = 'round'; sx.lineWidth = st.r * 2 * H; sx.beginPath(); st.pts.forEach(([u, v], i) => { const px = u * W - X0, py = v * H - Y0; i ? sx.lineTo(px, py) : sx.moveTo(px, py); }); if (st.pts.length === 1) { sx.arc(st.pts[0][0] * W - X0, st.pts[0][1] * H - Y0, st.r * H, 0, 7); sx.fill(); } else sx.stroke();
+  const sd = sx.getImageData(0, 0, CW, CH).data;
+  // 只保留和筆畫重疊的顯著區域（連通），擴張一點把邊緣與陰影包進來
+  const on = new Uint8Array(CW * CH); for (let i = 0; i < CW * CH; i++) on[i] = sal[i] > 0.45 ? 1 : 0;
+  const keep = new Uint8Array(CW * CH); const q = []; let overlap = 0, strokeN = 0; for (let i = 0; i < CW * CH; i++) { if (sd[i * 4 + 3] > 128) { strokeN++; if (on[i]) { overlap++; keep[i] = 1; q.push(i); } } }
+  if (overlap < strokeN * 0.25) return null;
+  while (q.length) { const i = q.pop(); const x = i % CW, y = (i / CW) | 0; for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= CW || ny >= CH) continue; const j = ny * CW + nx; if (on[j] && !keep[j]) { keep[j] = 1; q.push(j); } } }
+  let area = 0; for (const v of keep) area += v; if (area > CW * CH * 0.7) return null; // 抓到整張背景就放棄
+  const m = new Float32Array(W * H); const dil = Math.max(2, Math.round(Math.max(W, H) / 250));
+  for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) { if (!keep[y * CW + x] && sd[(y * CW + x) * 4 + 3] < 128) continue; for (let dy = -dil; dy <= dil; dy++) for (let dx = -dil; dx <= dil; dx++) { const X = X0 + x + dx, Y = Y0 + y + dy; if (X >= 0 && Y >= 0 && X < W && Y < H) m[Y * W + X] = 1; } }
+  return encodeRLE(m, W, H);
+}
 async function healUp() {
   if (!healStroke) return; const st = healStroke; healStroke = null;
-  const H = [...(E.edits.heal || []), { strokes: [st] }];
+  const md = E.healTool || 'remove'; let op = { strokes: [st] };
+  if (md === 'remove' && E.healDetect !== false) { try { const rle = await detectObjectMask(st); if (rle) op = { strokes: [st], rle, obj: true }; } catch (err) { console.warn('detect', err); } }
+  if (md === 'clone' || (md === 'heal' && E.cloneSrc)) { op = { mode: md, dx: E.cloneSrc[0] - st.pts[0][0], dy: E.cloneSrc[1] - st.pts[0][1], strokes: [st] }; }
+  else if (md === 'heal') { const [dx, dy] = autoHealSource(st); op = { mode: 'heal', dx, dy, strokes: [st] }; }
+  const H = [...(E.edits.heal || []), op];
   setEdit({ heal: H }, { label: '移除物件' }); setBusy('AI 補圖中…'); await sleep(30);
   refreshHeal(); setBusy(null); const o = $('#healOverlay'); o && o.getContext('2d').clearRect(0, 0, o.width, o.height); renderTools();
+}
+// ── 閉眼修復：從同一組連拍（或同資料夾）找睜眼的照片，把眼睛對齊後貼過來 ──
+const eyeSrcCache = new Map();
+async function loadEyeSrc(id) { if (eyeSrcCache.has(id)) return; const p = photoById(id); if (!p) return; const src = p.isRaw ? await decodeRaw(p.path, true) : await decodeImage(p.path); eyeSrcCache.set(id, src); while (eyeSrcCache.size > 3) eyeSrcCache.delete(eyeSrcCache.keys().next().value); }
+const EYE_IDX = [[33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246, 70, 63, 105, 66, 107, 226, 25, 110, 24, 23, 22, 26, 112], [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398, 300, 293, 334, 296, 336, 446, 255, 339, 254, 253, 252, 256, 341]];
+function fitAffine(T, S) { // 最小平方：S ≈ A·[T,1]
+  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], bx = [0, 0, 0], by = [0, 0, 0];
+  for (let i = 0; i < T.length; i++) { const v = [T[i][0], T[i][1], 1]; for (let a = 0; a < 3; a++) { for (let b = 0; b < 3; b++) M[a][b] += v[a] * v[b]; bx[a] += v[a] * S[i][0]; by[a] += v[a] * S[i][1]; } }
+  const solve = (b) => { const m = M.map((r, i) => [...r, b[i]]); for (let c = 0; c < 3; c++) { let p = c; for (let r = c + 1; r < 3; r++) if (Math.abs(m[r][c]) > Math.abs(m[p][c])) p = r; [m[c], m[p]] = [m[p], m[c]]; for (let r = 0; r < 3; r++) if (r !== c) { const f = m[r][c] / m[c][c]; for (let k = c; k < 4; k++) m[r][k] -= f * m[c][k]; } } return [m[0][3] / m[0][0], m[1][3] / m[1][1], m[2][3] / m[2][2]]; };
+  return [...solve(bx), ...solve(by)];
+}
+async function bitmapOf(p) { const b = await (await fetch(origPreviewURL(p))).blob(); return createImageBitmap(b); }
+function eyeCandidates() {
+  const p = E.photo; const g = p.ai?.group; let list = S.photos.filter(q => q.id !== p.id && (q.path !== p.path) && ((g && q.ai?.group === g) || q.folder === p.folder) && (q.ai?.faces || 0) > 0);
+  list.sort((a, b) => ((b.ai?.group === g) - (a.ai?.group === g)) || ((a.ai?.closed || 0) - (b.ai?.closed || 0))); return list.slice(0, 12);
+}
+async function openEyesFrom(srcId) {
+  setBusy('AI 對齊眼睛中…');
+  try {
+    await initAI(); const tp = E.photo, sp = photoById(srcId);
+    const w = Math.min(1600, engine.srcW), h = Math.round(w * engine.srcH / engine.srcW); const timg = engine.renderPixels({ ...DEFAULT_EDITS() }, w, h);
+    const tc = new OffscreenCanvas(w, h); tc.getContext('2d').putImageData(timg, 0, 0); const tf = await facesForEyes(tc); const sf = await facesForEyes(await bitmapOf(sp));
+    const eyes = []; let fixed = 0;
+    for (const f of tf) {
+      const closed = Math.max(...f.open) < 0.2 || (f.open[0] + f.open[1]) / 2 < 0.17; if (!closed && tf.length > 1) continue;
+      const cx = f.box[0] + f.box[2] / 2, cy = f.box[1] + f.box[3] / 2; let best = null;
+      for (const g of sf) { const d = Math.hypot(g.box[0] + g.box[2] / 2 - cx, g.box[1] + g.box[3] / 2 - cy) + Math.abs(g.box[2] - f.box[2]); if (Math.min(...g.open) > 0.18 && (!best || d < best.d)) best = { d, g }; }
+      if (!best || best.d > f.box[2] * 1.5 + 0.08) continue;
+      for (const idx of EYE_IDX) {
+        const T = idx.map(i => f.mesh[i]), Sp = idx.map(i => best.g.mesh[i]); const A = fitAffine(T, Sp);
+        const ring = idx.slice(0, 16).map(i => f.mesh[i]); const ex = ring.reduce((a, q) => a + q[0], 0) / ring.length, ey = ring.reduce((a, q) => a + q[1], 0) / ring.length;
+        const c1 = f.mesh[idx[0]], c2 = f.mesh[idx[8]]; const ew = Math.hypot((c2[0] - c1[0]) * engine.srcW, (c2[1] - c1[1]) * engine.srcH) / engine.srcW;
+        eyes.push({ A, cx: ex, cy: ey - ew * 0.12 * engine.srcW / engine.srcH, rx: ew * 0.95, ry: ew * 0.72, rot: Math.atan2((c2[1] - c1[1]) * engine.srcH, (c2[0] - c1[0]) * engine.srcW) });
+      }
+      fixed++;
+    }
+    if (!eyes.length) { console.warn('eyes: target', tf.map(f => f.open), 'source', sf.map(f => f.open)); toast('找不到可以對應的睜眼臉孔，請換一張照片試試'); setBusy(null); return; }
+    setEdit({ heal: [...(E.edits.heal || []), { mode: 'eyes', src: srcId, eyes }] }, { label: '閉眼修復' }); E.healKey = ''; refreshHeal(); toast(`已修復 ${fixed} 個人的眼睛（來源：${sp.name}）`); renderTools();
+  } catch (err) { console.warn(err); toast('閉眼修復失敗：' + err.message); }
+  setBusy(null);
+}
+function eyesHTML() {
+  const c = eyeCandidates(); const ops = (E.edits.heal || []).filter(o => o.mode === 'eyes');
+  return `<div class="sec"><div class="t"><span>閉眼修復（開眼）<span class="ai">AI</span></span></div><div class="hint" style="margin-bottom:6px">從同一組連拍或同資料夾挑一張睜眼的照片，AI 會用臉部 468 個特徵點把眼睛對齊、調和顏色後貼上（團體照特別好用）。</div>
+  ${c.length ? `<div class="eyec">${c.map(q => `<div class="ec" data-eyesrc="${q.id}" title="${esc(q.name)}"><img src="${thumbURL(q)}"><span>${q.ai?.closed ? '閉眼 ' + q.ai.closed : '睜眼'}</span></div>`).join('')}</div>` : '<div class="hint">同組或同資料夾沒有其他有人臉的照片</div>'}
+  ${ops.length ? `<div class="hint" style="margin-top:6px">已套用 ${ops.length} 次閉眼修復（可在「局部 → 移除 / 修復」清單中刪除）</div>` : ''}</div>`;
 }
 function refreshHeal() {
   const c = decodeCache.get(E.photo?.id); if (!c) return;
   const key = JSON.stringify([E.edits.heal || [], E.deblurDone || 0]); if (key === E.healKey) return; E.healKey = key;
   const t0 = performance.now();
   const base = E.deblurDone && c.deblurred ? c.deblurred : c.src;
-  const src = (E.edits.heal || []).length ? applyHeals(base, E.edits.heal) : base;
+  const need = (E.edits.heal || []).filter(o => o.mode === 'eyes' && !eyeSrcCache.has(o.src)).map(o => o.src);
+  if (need.length) { E.healKey = ''; Promise.all(need.map(loadEyeSrc)).then(() => refreshHeal()); }
+  const src = (E.edits.heal || []).length ? applyHeals(base, E.edits.heal, { eyeSrc: Object.fromEntries(eyeSrcCache) }) : base;
   engine.updateSource(src); draw();
   console.log('heal ms', Math.round(performance.now() - t0));
 }
@@ -1114,18 +1438,25 @@ function scheduleDeblur() {
   clearTimeout(deblurT);
   deblurT = setTimeout(async () => {
     const c = decodeCache.get(E.photo?.id); if (!c) return;
-    const amt = E.edits.deblur || 0; const run = ++deblurRun;
-    if (!amt) { E.deblurDone = 0; refreshHeal(); return; }
+    const amt = E.edits.deblur || 0, dn = E.edits.aiDenoise || 0; const run = ++deblurRun;
+    if (!amt && !dn) { E.deblurDone = 0; refreshHeal(); return; }
+    const dev = mlBackend === 'webgpu' ? '顯示卡' : 'CPU';
     try {
-      if (!c.deblurFull) { setBusy('AI 去模糊運算中… 0%'); c.deblurFull = await deblurAI(c.src, 1, (p) => setBusy(`AI 去模糊運算中（${mlBackend === 'webgpu' ? '顯示卡' : 'CPU'}）… ${Math.round(p * 100)}%`), () => run !== deblurRun); }
-      if (run !== deblurRun) return;
-      // 依強度混合
-      const s0 = c.src.data, s1 = c.deblurFull.data, out = new s0.constructor(s0.length); const k = amt / 100;
-      for (let i = 0; i < s0.length; i++) out[i] = s0[i] + (s1[i] - s0[i]) * k;
-      c.deblurred = { ...c.src, data: out }; E.deblurDone = amt; E.healKey = ''; refreshHeal();
-    } catch (err) { if (!/取消/.test(err.message)) { console.warn(err); toast('AI 去模糊失敗：' + err.message, 5000); } }
+      let base = c.src;
+      if (amt) {
+        if (!c.deblurFull) { setBusy('AI 去模糊運算中… 0%'); c.deblurFull = await deblurAI(c.src, 1, (p) => setBusy(`AI 去模糊運算中（${dev}）… ${Math.round(p * 100)}%`), () => run !== deblurRun); }
+        if (run !== deblurRun) return;
+        const s0 = c.src.data, s1 = c.deblurFull.data, out = new s0.constructor(s0.length); const k = amt / 100;
+        for (let i = 0; i < s0.length; i++) out[i] = s0[i] + (s1[i] - s0[i]) * k; base = { ...c.src, data: out };
+      }
+      if (dn) {
+        const key = amt + ':' + dn; if (c.denoiseKey !== key) { setBusy('AI 降噪運算中… 0%'); c.denoised = await denoiseAI(base, dn / 100 * 0.12, (p) => setBusy(`AI 降噪運算中（${dev}）… ${Math.round(p * 100)}%`), () => run !== deblurRun); c.denoiseKey = key; }
+        if (run !== deblurRun) return; base = c.denoised;
+      }
+      c.deblurred = base; E.deblurDone = amt + ':' + dn; E.healKey = ''; refreshHeal();
+    } catch (err) { if (!/取消/.test(err.message)) { console.warn(err); toast('AI 運算失敗：' + err.message, 5000); } }
     setBusy(null);
-  }, 500);
+  }, 600);
 }
 async function autoLines() {
   if (!E.masks) { toast('AI 還在分析，請稍候'); return; }
@@ -1297,17 +1628,20 @@ async function renderPhotoOffscreen(p, fn, half, opts) {
     look = await cameraLook(src, jb);
   }
   if (edits.deblur) src = await deblurAI(src, edits.deblur / 100, opts?.onDeblur);
-  if ((edits.heal || []).length) src = applyHeals(src, edits.heal);
+  if (edits.aiDenoise) src = await denoiseAI(src, edits.aiDenoise / 100 * 0.12, opts?.onDeblur);
+  if ((edits.heal || []).length) { for (const o of edits.heal) if (o.mode === 'eyes') await loadEyeSrc(o.src); src = applyHeals(src, edits.heal, { eyeSrc: Object.fromEntries(eyeSrcCache) }); }
   const eng = bgEngine(); eng.setSource(src); eng.setBase(look.lut, look.sat);
   const needAI = needsAI(edits) || (opts && opts.alpha);
   if (needAI) {
     await initAI();
     const s = Math.min(1, 1536 / Math.max(src.width, src.height)); const w = Math.round(src.width * s), h = Math.round(src.height * s);
     const img = eng.renderPixels({ ...DEFAULT_EDITS(), temp: edits.temp, tint: edits.tint, exposure: edits.exposure, sharpen: 0, colorNoise: 0 }, w, h);
-    const m = await buildMasks(img); eng.setMasks(m); eng.setPins(pinsFor(m.pins, edits));
+    const m = await buildMasks(img); eng.setMasks(applyMaskFix(m, edits.maskFix)); eng.setPins(pinsFor(m.pins, edits));
     if (edits.enhance && !edits.enhanceVec) edits.enhanceVec = enhanceVector(eng, edits, m);
   } else if (edits.enhance && !edits.enhanceVec) edits.enhanceVec = enhanceVector(eng, edits, null);
   if (edits.lutPath && edits.lutAmt > 0 && eng.lutKey !== edits.lutPath) await eng.loadLUT(edits.lutPath);
+  if (edits.fivekAmt > 0 && edits.fivekW) { const d = await fivekLUT(edits.fivekW); eng.fiveKey = null; eng.onNeedFive = (w, cb) => cb(d); eng.ensureFivek(edits.fivekW); }
+  if (edits.lowLight > 0) { const small = eng.renderPixels({ ...DEFAULT_EDITS(), temp: edits.temp, tint: edits.tint, exposure: edits.exposure }, Math.min(512, src.width), Math.round(Math.min(512, src.width) * src.height / src.width)); eng.setLowGain(await lowLightGain(small)); } else eng.setLowGain(null);
   if (edits.skyType === 'custom' && edits.skyImg && edits.skyRep > 0 && eng.skyImgKey !== edits.skyImg) await eng.loadSkyImage(edits.skyImg);
   await fn(eng, edits);
   eng.dispose();
@@ -1358,7 +1692,7 @@ async function runOptimize(ids, opt) {
       let src = c?.src, look = c?.look;
       if (!src) { src = p.isRaw ? await decodeRaw(p.path, true) : await decodeImage(p.path); let jb = null; try { jb = await (await fetch(origPreviewURL(p))).blob(); } catch {} look = await cameraLook(src, jb); }
       const old = { ...DEFAULT_EDITS(), ...clone(p.edits || {}) };
-      if ((old.heal || []).length) src = applyHeals(src, old.heal);
+      if ((old.heal || []).length) { for (const o of old.heal) if (o.mode === 'eyes') await loadEyeSrc(o.src); src = applyHeals(src, old.heal, { eyeSrc: Object.fromEntries(eyeSrcCache) }); }
       const eng = bgEngine(); eng.setSource(src); eng.setBase(look.lut, look.sat);
       const s = Math.min(1, 1536 / Math.max(src.width, src.height));
       const img = eng.renderPixels({ ...DEFAULT_EDITS(), sharpen: 0, colorNoise: 0 }, Math.round(src.width * s), Math.round(src.height * s));
@@ -1369,7 +1703,7 @@ async function runOptimize(ids, opt) {
       else ne = { ...r.edits, crop: old.crop, heal: old.heal, deblur: old.deblur };
       p.edits = ne; p.ai = { ...(p.ai || {}), scene: r.scene.scene };
       await api.updatePhotos(S.cur.id, [p.id], { edits: ne, ai: p.ai });
-      eng.setMasks(masks); eng.setPins(pinsFor(masks.pins, ne));
+      eng.setMasks(applyMaskFix(masks, ne.maskFix)); eng.setPins(pinsFor(masks.pins, ne));
       await writeEditedThumbs(p, eng, ne);
       eng.dispose();
       if (E.photo?.id === p.id && S.view === 'edit') { E.edits = { ...DEFAULT_EDITS(), ...clone(ne) }; engine.setPins(pinsFor(E.masks?.pins, E.edits)); draw(); renderTools(); }
@@ -1403,6 +1737,7 @@ async function exportDialog() {
   <div class="row"><label>資料夾</label><input type="text" id="xDir" value="${esc(o.dir)}" placeholder="選擇匯出資料夾" readonly><div class="btn sm" id="xPick">選擇…</div></div>
   <div class="row"><label>尺寸</label><select id="xSize"><option value="orig" ${o.size === 'orig' ? 'selected' : ''}>原始大小（完整解析度）</option><option value="long" ${o.size === 'long' ? 'selected' : ''}>長邊指定像素</option></select><input type="number" id="xLong" value="${o.long}" style="width:80px" ${o.size === 'long' ? '' : 'disabled'}> px</div>
   <div class="row"><label>格式</label><select id="xFmt"><option value="jpg" ${o.fmt !== 'png' && o.fmt !== 'pngA' ? 'selected' : ''}>JPG</option><option value="png" ${o.fmt === 'png' ? 'selected' : ''}>PNG</option><option value="pngA" ${o.fmt === 'pngA' ? 'selected' : ''}>PNG（透明背景，AI 去背）</option></select></div>
+  <div class="row"><label>AI 放大</label><select id="xUp"><option value="1" ${(o.upscale || 1) == 1 ? 'selected' : ''}>不放大</option><option value="2" ${o.upscale == 2 ? 'selected' : ''}>2 倍（Real-ESRGAN 超解析度）</option><option value="4" ${o.upscale == 4 ? 'selected' : ''}>4 倍（Real-ESRGAN 超解析度）</option></select></div>
   <div class="row"><label>JPG 品質</label><input type="range" id="xQ" min="60" max="100" value="${o.quality}" style="flex:1"><span id="xQv">${o.quality}</span></div>
   <div class="row"><label>檔名</label><select id="xName"><option value="orig" ${o.naming === 'orig' ? 'selected' : ''}>原始檔名</option><option value="seq" ${o.naming === 'seq' ? 'selected' : ''}>專案名稱_序號</option><option value="custom" ${o.naming === 'custom' ? 'selected' : ''}>自訂檔名…</option></select></div>
   <div id="xTplBox" class="${o.naming === 'custom' ? '' : 'hidden'}" style="margin:-2px 0 8px 92px">
@@ -1427,7 +1762,7 @@ async function exportDialog() {
   $('#xPick').onclick = async () => { const d = await api.pickExportDir(); if (d) $('#xDir').value = d; };
   $('#xCancel').onclick = () => m.classList.add('hidden');
   $('#xGo').onclick = async () => {
-    const opt = { fmt: $('#xFmt').value, scope: $('#xScope').value, dir: $('#xDir').value, quality: +$('#xQ').value, size: $('#xSize').value, long: +$('#xLong').value || 2048, naming: $('#xName').value, tpl: $('#xTpl').value, seqStart: +$('#xSeqS').value || 1, seqDigits: +$('#xSeqD').value || 3, wm: $('#xWm').value, wmPos: $('#xWmPos').value, wmOpacity: +$('#xWmO').value };
+    const opt = { fmt: $('#xFmt').value, scope: $('#xScope').value, dir: $('#xDir').value, quality: +$('#xQ').value, size: $('#xSize').value, long: +$('#xLong').value || 2048, upscale: +$('#xUp').value, naming: $('#xName').value, tpl: $('#xTpl').value, seqStart: +$('#xSeqS').value || 1, seqDigits: +$('#xSeqD').value || 3, wm: $('#xWm').value, wmPos: $('#xWmPos').value, wmOpacity: +$('#xWmO').value };
     if (!opt.dir) { const d = await api.pickExportDir(); if (!d) return; opt.dir = d; }
     S.settings.export = opt; saveSettings();
     const ids = opt.scope === 'sel' ? [...S.sel] : opt.scope === 'pick' ? S.photos.filter(p => p.flag === 1).map(p => p.id) : filtered().map(p => p.id);
@@ -1454,6 +1789,13 @@ async function runExport(ids, opt) {
         let oc = new OffscreenCanvas(cw, ch); oc.getContext('2d').putImageData(img, 0, 0);
         let W = cw, H = ch;
         if (opt.size === 'long') { const s = Math.min(1, opt.long / Math.max(cw, ch)); W = Math.round(cw * s); H = Math.round(ch * s); if (s < 1) { const bmp = await createImageBitmap(oc, { resizeWidth: W, resizeHeight: H, resizeQuality: 'high' }); oc = new OffscreenCanvas(W, H); oc.getContext('2d').drawImage(bmp, 0, 0); } }
+        // AI 放大（Real-ESRGAN）：先在原尺寸算 4 倍，再縮到需要的倍率；太大的照片會先縮到安全尺寸
+        if (opt.upscale > 1) {
+          let src0 = oc; const lim = 2600; if (Math.max(W, H) > lim) { const s2 = lim / Math.max(W, H); const bmp = await createImageBitmap(oc, { resizeWidth: Math.round(W * s2), resizeHeight: Math.round(H * s2), resizeQuality: 'high' }); src0 = new OffscreenCanvas(bmp.width, bmp.height); src0.getContext('2d').drawImage(bmp, 0, 0); }
+          const id0 = src0.getContext('2d').getImageData(0, 0, src0.width, src0.height);
+          const big = await upscaleAI(id0, opt.upscale, (pp) => { $('#xMsg').textContent = `${done + 1} / ${ids.length}　${p.name}　AI 放大 ${Math.round(pp * 100)}%`; });
+          oc = new OffscreenCanvas(big.width, big.height); oc.getContext('2d').putImageData(big, 0, 0); W = big.width; H = big.height;
+        }
         if (opt.wm) {
           const x = oc.getContext('2d'); const fs = Math.max(14, Math.round(Math.max(W, H) * 0.022));
           x.font = `600 ${fs}px "Microsoft JhengHei", "Noto Sans CJK TC", sans-serif`; x.globalAlpha = opt.wmOpacity / 100; x.fillStyle = '#fff'; x.shadowColor = 'rgba(0,0,0,.5)'; x.shadowBlur = fs * 0.2;
@@ -1522,6 +1864,81 @@ function filmMenuItems(ids) {
   const off = ['取消底片色調', () => applyToPhotos(ids, (b) => { const d = DEFAULT_EDITS(); const o = { ...b }; FILM_LOOK_KEYS.forEach(k => o[k] = clone(d[k])); o.film = null; return o; }, '取消底片色調')];
   return [...groups.map(g => [g.name, null, g.items]), '-', off];
 }
+// ─────────────────────────── 右鍵選單：所有功能的清單（可在設定裡自訂顯示與順序） ───────────────────────────
+const COLORS_L = [['red', '紅'], ['yellow', '黃'], ['green', '綠'], ['blue', '藍'], ['purple', '紫']];
+const MENU_ACTIONS = {
+  optimize: { label: '✦ AI 最佳化修圖', make: (ids) => [`✦ AI 最佳化修圖（${ids.length} 張）`, () => aiOptimizeDialog(ids)] },
+  edit: { label: '編輯', make: (ids) => ['編輯', () => { S.focus = ids[0]; switchView('edit'); }] },
+  copyVirtual: { label: '建立副本（虛擬副本）', make: (ids) => ['建立副本', () => duplicatePhotos(ids)] },
+  copy: { label: '複製修圖設定', make: (ids) => ['複製修圖設定', () => copySettings(ids[0])] },
+  paste: { label: '貼上修圖設定', make: (ids) => ['貼上修圖設定', () => pasteSettings(ids)] },
+  preset: { label: '套用預設', make: (ids, ev) => ['套用預設', null, [...BUILTIN_PRESETS, ...S.presets].map(pr => [pr.name, () => applyToPhotos(ids, (b) => ({ ...presetEdits(pr), crop: b.crop }), '套用預設')])] },
+  film: { label: '軟片模擬', make: (ids) => ['軟片模擬', null, filmMenuItems(ids)] },
+  beauty: { label: '一鍵人像美化', make: (ids) => ['一鍵人像美化', () => applyToPhotos(ids, (b) => ({ ...b, ...beautyPatch() }), '一鍵人像美化')] },
+  deblur: { label: 'AI 去模糊', make: (ids) => ['AI 去模糊（救回失焦）', () => applyToPhotos(ids, (b) => ({ ...b, deblur: 70 }), 'AI 去模糊')] },
+  rating: { label: '設定星等', make: (ids) => ['設定星等', null, [0, 1, 2, 3, 4, 5].map(n => [n ? '★'.repeat(n) : '無星等', () => patchPhotos(ids, { rating: n })])] },
+  flag: { label: '設定旗標', make: (ids) => ['旗標', null, [['⚑ 選取', 1], ['✕ 淘汰', -1], ['取消旗標', 0]].map(([l, v]) => [l, () => patchPhotos(ids, { flag: v })])] },
+  color: { label: '設定色標', make: (ids) => ['色標', null, [...COLORS_L.map(([k, l]) => [l, () => patchPhotos(ids, { color: k })]), ['無色標', () => patchPhotos(ids, { color: '' })]]] },
+  filterRating: { label: '篩選星等', make: () => ['篩選：星等', null, [0, 1, 2, 3, 4, 5].map(n => [n ? `★${n} 以上` : '全部顯示', () => { S.filter.minRating = n; refreshAfterFilter(); }])] },
+  filterColor: { label: '篩選色標', make: () => ['篩選：色標', null, [...COLORS_L.map(([k, l]) => [l, () => { S.filter.color = k; refreshAfterFilter(); }]), ['全部顯示', () => { S.filter.color = null; refreshAfterFilter(); }]]] },
+  filterFlag: { label: '篩選旗標', make: () => ['篩選：旗標', null, [['只看已選', 'pick'], ['只看淘汰', 'reject'], ['全部顯示', null]].map(([l, v]) => [l, () => { S.filter.flag = v; refreshAfterFilter(); }])] },
+  filterClear: { label: '清除所有篩選', make: () => ['清除所有篩選', () => { S.filter = { ...S.filter, minRating: 0, flag: null, color: null, edited: null, smart: null }; refreshAfterFilter(); }] },
+  reset: { label: '重設修圖', make: (ids) => ['重設修圖', () => applyToPhotos(ids, (b) => ({ ...DEFAULT_EDITS(), crop: b.crop }), '重設修圖')] },
+  export: { label: '匯出…', make: (ids) => ['匯出…', () => { S.sel = new Set(ids); exportDialog(); }] },
+  reveal: { label: '在檔案總管中顯示', make: (ids) => ['在檔案總管中顯示', () => api.reveal(photoById(ids[0]).path)] },
+  remove: { label: '從專案移除', make: (ids) => ['從專案移除（不刪原始檔）', async () => { if (!(await api.confirm(`從專案移除 ${ids.length} 張照片？`, '原始檔案不會被刪除。'))) return; await api.removePhotos(S.cur.id, ids); S.photos = S.photos.filter(p => !ids.includes(p.id)); S.sel.clear(); if (S.view === 'edit' && ids.includes(E.photo?.id)) { const n = filtered()[0]; n ? openEdit(n.id) : switchView('lib'); } else renderLibrary(); renderFilm(); }] },
+  sep: { label: '──── 分隔線 ────', make: () => '-' }
+};
+const MENU_DEFAULT = {
+  lib: ['optimize', 'edit', 'copyVirtual', 'sep', 'copy', 'paste', 'preset', 'film', 'beauty', 'deblur', 'reset', 'sep', 'rating', 'flag', 'color', 'sep', 'filterRating', 'filterColor', 'filterClear', 'sep', 'export', 'reveal', 'remove'],
+  film: ['copyVirtual', 'sep', 'copy', 'paste', 'film', 'beauty', 'preset', 'optimize', 'reset', 'sep', 'rating', 'color', 'flag', 'sep', 'filterRating', 'filterColor', 'filterClear', 'sep', 'export', 'reveal', 'remove']
+};
+function menuOrder(kind) { return S.settings.menus?.[kind] || MENU_DEFAULT[kind]; }
+function contextMenuFor(kind, ids, ev) { const items = menuOrder(kind).map(k => MENU_ACTIONS[k]?.make(ids, ev)).filter(Boolean); while (items[0] === '-') items.shift(); while (items[items.length - 1] === '-') items.pop(); return items.filter((it, i) => !(it === '-' && items[i - 1] === '-')); }
+function refreshAfterFilter() { renderLibrary(); if (S.view === 'edit') renderFilm(); }
+async function duplicatePhotos(ids) {
+  if (S.view === 'edit') await persistEdits();
+  const added = await api.duplicatePhotos(S.cur.id, ids); if (!added?.length) return;
+  for (const n of added) { const i = S.photos.findIndex(p => p.id === (ids.find(id => photoById(id)?.path === n.path) || '')); S.photos.splice(i >= 0 ? i + 1 : S.photos.length, 0, n); }
+  toast(`已建立 ${added.length} 個副本（同一個原始檔、獨立修圖）`); renderLibrary(); renderFilm();
+}
+// ── 設定視窗：右鍵選單自訂、縮圖資訊 ──
+function settingsDialog(tab = 'lib') {
+  const m = $('#modal'); let cur = tab;
+  const draft = { lib: [...menuOrder('lib')], film: [...menuOrder('film')] }; const info = { ...(S.settings.thumbInfo || INFO_DEFAULT) };
+  const render = () => {
+    let body = '';
+    if (cur === 'lib' || cur === 'film') {
+      const list = draft[cur]; const unused = Object.keys(MENU_ACTIONS).filter(k => k !== 'sep' && !list.includes(k));
+      body = `<div class="hint" style="margin-bottom:8px">勾選要出現在右鍵選單的功能，用 ↑ ↓ 或拖曳調整順序。</div><div class="mlist">${list.map((k, i) => `<div class="mrow" draggable="true" data-i="${i}"><input type="checkbox" checked data-off="${i}"><span class="nm">${MENU_ACTIONS[k].label}</span><span class="b" data-up="${i}">↑</span><span class="b" data-dn="${i}">↓</span></div>`).join('')}
+        ${unused.map(k => `<div class="mrow off"><input type="checkbox" data-on="${k}"><span class="nm">${MENU_ACTIONS[k].label}</span></div>`).join('')}</div>
+        <div style="display:flex;gap:6px;margin-top:8px"><div class="btn sm" data-addsep="1">＋ 分隔線</div><div class="btn sm" data-def="1">恢復預設</div></div>`;
+    } else {
+      body = `<div class="hint" style="margin-bottom:8px">選擇圖庫縮圖下方要顯示哪些資訊、放在哪個位置。</div>${INFO_FIELDS.map(([k, l]) => `<div class="row"><label>${l}</label><select data-info="${k}">${INFO_SLOTS.map(([v, n]) => `<option value="${v}" ${(info[k] || 'off') === v ? 'selected' : ''}>${n}</option>`).join('')}</select></div>`).join('')}`;
+    }
+    m.innerHTML = `<div class="modal" style="width:520px"><h3>設定</h3><div class="ttabs" style="margin-bottom:10px">${[['lib', '圖庫右鍵選單'], ['film', '編輯頁底片列右鍵選單'], ['info', '縮圖資訊']].map(([k, l]) => `<div class="ttab ${cur === k ? 'on' : ''}" data-stab="${k}">${l}</div>`).join('')}</div>
+      <div style="max-height:56vh;overflow-y:auto">${body}</div><div class="acts"><div class="btn" id="sCancel">取消</div><div class="btn p" id="sOk">儲存</div></div></div>`;
+    m.classList.remove('hidden');
+  };
+  render();
+  let dragI = null;
+  m.onclick = (e) => {
+    const t = e.target; const L = draft[cur];
+    if (t.dataset.stab) { cur = t.dataset.stab; render(); return; }
+    if (t.dataset.up != null) { const i = +t.dataset.up; if (i > 0) [L[i - 1], L[i]] = [L[i], L[i - 1]]; render(); return; }
+    if (t.dataset.dn != null) { const i = +t.dataset.dn; if (i < L.length - 1) [L[i + 1], L[i]] = [L[i], L[i + 1]]; render(); return; }
+    if (t.dataset.off != null) { L.splice(+t.dataset.off, 1); render(); return; }
+    if (t.dataset.on) { L.push(t.dataset.on); render(); return; }
+    if (t.dataset.addsep) { L.push('sep'); render(); return; }
+    if (t.dataset.def) { draft[cur] = [...MENU_DEFAULT[cur]]; render(); return; }
+    if (t.id === 'sCancel') { m.classList.add('hidden'); return; }
+    if (t.id === 'sOk') { S.settings.menus = { lib: draft.lib, film: draft.film }; S.settings.thumbInfo = info; saveSettings(); m.classList.add('hidden'); renderLibrary(); toast('設定已儲存'); }
+  };
+  m.onchange = (e) => { if (e.target.dataset.info) info[e.target.dataset.info] = e.target.value; };
+  m.ondragstart = (e) => { const r = e.target.closest('.mrow[data-i]'); if (r) dragI = +r.dataset.i; };
+  m.ondragover = (e) => { if (dragI != null && e.target.closest('.mrow[data-i]')) e.preventDefault(); };
+  m.ondrop = (e) => { const r = e.target.closest('.mrow[data-i]'); if (!r || dragI == null) return; e.preventDefault(); const L = draft[cur]; const [it] = L.splice(dragI, 1); L.splice(+r.dataset.i, 0, it); dragI = null; render(); };
+}
 function presetMenu(x, y, ids) {
   const all = [...BUILTIN_PRESETS, ...S.presets];
   showMenu(x, y, all.map(pr => [pr.name, () => applyToPhotos(ids, (b) => ({ ...presetEdits(pr), crop: b.crop }), '套用預設')]));
@@ -1577,8 +1994,8 @@ function bindGlobal() {
     const t = e.target.closest('.th'); if (!t) return; e.preventDefault();
     if (!S.sel.has(t.dataset.id)) select(t.dataset.id);
     const ids = targets();
+    showMenu(e.clientX, e.clientY, contextMenuFor('lib', ids, e)); return;
     showMenu(e.clientX, e.clientY, [
-      [`✦ AI 最佳化修圖（${ids.length} 張）`, () => aiOptimizeDialog(ids)],
       ['編輯', () => switchView('edit')],
       ['複製修圖設定', () => copySettings()], ['貼上修圖設定', () => pasteSettings(ids)],
       ['套用預設…', () => presetMenu(e.clientX, e.clientY, ids)],
@@ -1625,6 +2042,9 @@ function bindGlobal() {
     if (t.dataset.k === 'enhance' && !E.edits.enhanceVec && engine?.srcTex) E.edits.enhanceVec = enhanceVector(engine, E.edits, E.masks);
     if (t.dataset.k) { const k = t.dataset.k; let v = parseFloat(t.value); setEdit({ [k]: v }, { label: t.closest('.sl').querySelector('label').textContent }); const s = Object.values(GROUPS).flat().flatMap(g => g.items || []).find(x => x.key === k); const em = t.parentElement.querySelector('em'); em.textContent = s?.fmt ? s.fmt(v) : (v > 0 && (s ? s.min < 0 : false) ? '+' : '') + Math.round(v); t.classList.toggle('ch', v !== DEFAULT_EDITS()[k]); t.parentElement.querySelector('.rsk')?.classList.toggle('off', v === DEFAULT_EDITS()[k]); }
     if (t.dataset.hk) { const arr = [...E.edits[t.dataset.hk]]; arr[+t.dataset.i] = +t.value; setEdit({ [t.dataset.hk]: arr }, { label: 'HSL' }); t.parentElement.querySelector('em').textContent = (t.value > 0 ? '+' : '') + t.value; }
+    if (t.dataset.pck) { const P = clone(E.edits.pointColors || []); const q = P[E.pcSel ?? 0]; if (!q) return; q[t.dataset.pck] = +t.value; t.nextElementSibling.textContent = t.value; setEdit({ pointColors: P }, { label: '點顏色' }); return; }
+    if (t.dataset.lgeo) { const L = clone(E.edits.local); const l = L[E.layerSel]; l.geo = { ...(l.geo || {}) }; const v = +t.value; if (t.dataset.lgeo === 'rot') { l.geo.rot = v * Math.PI / 180; t.nextElementSibling.textContent = v + '°'; } else { l.geo.f = v; t.nextElementSibling.textContent = v; } setEdit({ local: L }, { label: '漸層' }); positionGrad(); return; }
+    if (t.dataset.ltint) { const L = clone(E.edits.local); L[E.layerSel].tintC = t.value; if (!L[E.layerSel].tintA) L[E.layerSel].tintA = 30; setEdit({ local: L }, { label: '圖層顏色' }); return; }
     if (t.id === 'brSize') { E.brush.size = +t.value / 1000; t.nextElementSibling.textContent = t.value; updBrushCursor(); return; }
     if (t.id === 'brFeather') { E.brush.f = +t.value / 100; t.nextElementSibling.textContent = t.value; return; }
     if (t.id === 'brFlow') { E.brush.flow = +t.value / 100; t.nextElementSibling.textContent = t.value; return; }
@@ -1640,6 +2060,7 @@ function bindGlobal() {
   });
   $('#tools').addEventListener('change', (e) => {
     if (e.target.id === 'layerAddAI' && e.target.value) { addLayer(e.target.value); return; }
+    if (e.target.id === 'lensSearch') { const v = e.target.value.trim(); const ok = lensDB?.lenses.some(l => (l.maker + ' ' + l.model) === v); setEdit({ lensName: ok ? v : '' }, { label: '選擇鏡頭' }); if (ok) applyLensProfile(true); else renderTools(); return; }
     if (e.target.id === 'layerBase') { const L = clone(E.edits.local); L[E.layerSel].mask = e.target.value; setEdit({ local: L }, { label: '圖層範圍' }); renderTools(); return; }
   });
   $('#tools').addEventListener('change', (e) => { if (e.target.id === 'filmSel') { const v = e.target.value; if (v) applyFilm(v, E.edits.film?.amt || 100); else { const d = DEFAULT_EDITS(); const patch = {}; FILM_LOOK_KEYS.forEach(k => patch[k] = d[k]); patch.film = null; setEdit(patch, { label: '取消底片色調' }); renderEditSide(); } renderTools(); } });
@@ -1647,10 +2068,11 @@ function bindGlobal() {
   // 放開滑桿後，若區塊標題還沒有「重設」按鈕就重畫一次讓它出現（或在全部歸零時消失）
   $('#tools').addEventListener('change', (e) => {
     const t = e.target; if (!t.matches('input[type=range]')) return; const sec = t.closest('.sec'); if (!sec) return;
-    const has = !!sec.querySelector('.t .rst'); const g = GROUPS[E.tab]?.find(gg => (gg.items || []).some(i => i.key === t.dataset.k) || (gg.hsl && t.dataset.hk) || (gg.refocusUI && ['deblur', 'defocus', 'defocusR', 'focusAmt', 'focusRange'].includes(t.dataset.k)));
+    const has = !!sec.querySelector('.t .rst'); const g = Object.values(GROUPS).flat().find(gg => (gg.items || []).some(i => i.key === t.dataset.k) || (gg.hsl && t.dataset.hk) || (gg.refocusUI && ['deblur', 'defocus', 'defocusR', 'focusAmt', 'focusRange'].includes(t.dataset.k)));
     if (g && has !== groupChanged(g)) { const st = $('#tools').scrollTop; renderTools(); $('#tools').scrollTop = st; }
   });
   $('#tools').addEventListener('dblclick', (e) => {
+    const tt = e.target.closest('.ttab[data-tab]'); if (tt) { setPanelState(tt.dataset.tab, { mode: 'float', x: Math.max(20, $('#tools').getBoundingClientRect().left - 340), y: 90 }); renderTools(); return; }
     const lb = e.target.closest('.sl > label, .sl > em'); if (lb) { const r = lb.parentElement.querySelector('input[data-k]'); if (r) { resetKeys([r.dataset.k], '重設 ' + lb.parentElement.querySelector('label').textContent); return; } }
     const t = e.target.closest('input[type=range]'); if (!t) return;
     if (t.dataset.k) { setEdit({ [t.dataset.k]: DEFAULT_EDITS()[t.dataset.k] }, { label: '重設' }); renderTools(); }
@@ -1658,8 +2080,14 @@ function bindGlobal() {
     if (t.id === 'angle') { setEdit({ crop: cropForAngle(E.edits.crop, 90 * quarterOf(E.edits.crop.angle)) }); renderTools(); }
   });
   $('#tools').addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-leye],[data-lsel],[data-rstg],[data-rstk],[data-tab],[data-hsl],[data-act],[data-aspect],[data-skytype],[data-mist],[data-hair],[data-bgtype],[data-addlocal],[data-dellocal],[data-delheal]'); if (!t) return;
-    if (t.dataset.tab) { E.tab = t.dataset.tab; if (E.tab !== 'crop' && E.crop) { E.crop = false; layoutCanvas(); draw(); } if (E.tab !== 'local' && E.brushMode) setBrushMode(false); renderTools(); draw(); }
+    const t = e.target.closest('[data-eyesrc],[data-healtool],[data-pcsel],[data-masksel],[data-pop],[data-dock],[data-hide],[data-collapse],[data-leye],[data-lsel],[data-rstg],[data-rstk],[data-tab],[data-hsl],[data-act],[data-aspect],[data-skytype],[data-skyph],[data-mist],[data-hair],[data-bgtype],[data-addlocal],[data-dellocal],[data-delheal]'); if (!t) return;
+    if (t.dataset.pop) { setPanelState(t.dataset.pop, { mode: 'float', x: Math.max(20, $('#tools').getBoundingClientRect().left - 340), y: 90 }); renderTools(); return; }
+    if (t.dataset.dock) { setPanelState(t.dataset.dock, { mode: 'dock' }); E.tab = t.dataset.dock; renderTools(); return; }
+    if (t.dataset.hide) { setPanelState(t.dataset.hide, { mode: 'hidden' }); renderTools(); return; }
+    if (t.dataset.collapse) { setPanelState(t.dataset.collapse, { collapsed: !panelState(t.dataset.collapse).collapsed }); renderTools(); return; }
+    if (t.dataset.tab && e.detail >= 2) { setPanelState(t.dataset.tab, { mode: 'float', x: Math.max(20, $('#tools').getBoundingClientRect().left - 340), y: 90 }); renderTools(); return; }
+    if (t.dataset.tab && panelState(t.dataset.tab).mode !== 'dock') { setPanelState(t.dataset.tab, { mode: 'dock' }); }
+    if (t.dataset.tab) { E.tab = t.dataset.tab; if (E.tab !== 'crop' && E.crop) { E.crop = false; layoutCanvas(); draw(); } if (!tabVisible('layers') && !tabVisible('ai') && E.brushMode) setBrushMode(false); renderTools(); draw(); }
     if (t.dataset.hsl) { E.hslTab = t.dataset.hsl; renderTools(); }
     if (t.dataset.aspect) { setEdit({ crop: fitAspect({ ...E.edits.crop, aspect: t.dataset.aspect }, t.dataset.aspect) }, { label: '裁切比例' }); if (!E.crop) { E.crop = true; layoutCanvas(); draw(); } renderTools(); }
     const a = t.dataset.act;
@@ -1669,18 +2097,33 @@ function bindGlobal() {
     if (t.dataset.leye != null) { const L = clone(E.edits.local); const l = L[+t.dataset.leye]; l.on = l.on === false; setEdit({ local: L }, { label: '圖層顯示' }); renderTools(); return; }
     if (t.dataset.addlocal) { const L = [...(E.edits.local || [])]; if (L.length >= 4) { toast('最多 4 個局部調整'); return; } L.push({ mask: t.dataset.addlocal, exp: 0, con: 0, sat: 0, temp: 0 }); setEdit({ local: L }, { label: '新增局部調整' }); renderTools(); }
     if (t.dataset.dellocal) { const L = [...E.edits.local]; L.splice(+t.dataset.dellocal, 1); setEdit({ local: L }, { label: '刪除圖層' }); E.layerSel = Math.min(E.layerSel ?? 0, L.length - 1); if (!L.length) setBrushMode(false); renderTools(); draw(); return; }
+    if (t.dataset.masksel) { E.maskSel = t.dataset.masksel; renderTools(); draw(); return; }
+    if (a === 'maskShow') { E.maskShow = !E.maskShow; renderTools(); draw(); return; }
+    if (a === 'maskAdd' || a === 'maskSub') { const er = a === 'maskSub'; if (E.brushMode && E.brushTarget === 'mask' && E.brush.erase === er) setBrushMode(false); else { E.brush.erase = er; setBrushMode(true, 'mask'); if (!E.maskShow) E.maskShow = true; } renderTools(); draw(); return; }
+    if (a === 'maskClear') { const F = clone(E.edits.maskFix || {}); delete F[E.maskSel || 'skin']; setEdit({ maskFix: F }, { label: '清除範圍筆畫' }); renderTools(); return; }
+    if (a === 'maskFixReset') { setEdit({ maskFix: {} }, { label: '重設 AI 範圍' }); renderTools(); return; }
+    if (a === 'fivek') { runFivek(); return; }
+    if (a === 'autoUpright') { autoUpright(); return; }
+    if (a === 'healDetect') { E.healDetect = E.healDetect === false; renderTools(); return; }
+    if (a === 'lensProf') { applyLensProfile(!E.edits.lensProf); return; }
+    if (t.dataset.eyesrc) { openEyesFrom(t.dataset.eyesrc); return; }
+    if (t.dataset.healtool) { E.healTool = t.dataset.healtool; if (E.healTool === 'remove') E.cloneSrc = null; renderTools(); return; }
+    if (t.dataset.pcsel != null) { E.pcSel = +t.dataset.pcsel; renderTools(); return; }
+    if (a === 'pcDel') { const P = clone(E.edits.pointColors || []); P.splice(E.pcSel ?? 0, 1); E.pcSel = Math.max(0, (E.pcSel ?? 0) - 1); setEdit({ pointColors: P }, { label: '刪除點顏色' }); renderTools(); return; }
+    if (a === 'pcDrop') { E.pcDrop = true; toast('在照片上點一下要調整的顏色'); return; }
     if (a === 'layerAddBrush') { addLayer('none'); return; }
+    if (a === 'gradLinear' || a === 'gradRadial') { const lin = a === 'gradLinear'; addLayer(lin ? 'linear' : 'radial'); const L = clone(E.edits.local); const l = L[L.length - 1]; l.name = lin ? '線性漸層' : '放射漸層'; l.geo = lin ? { x0: 0.5, y0: 0.05, x1: 0.5, y1: 0.45 } : { cx: 0.5, cy: 0.5, rx: 0.25, ry: 0.25 * engine.srcW / engine.srcH, rot: 0, f: 50 }; if (lin) l.exp = -40; else { l.exp = 25; } setEdit({ local: L }, { label: l.name }); renderTools(); positionGrad(); return; }
     if (a === 'dodge' || a === 'burn') { addLayer('none'); const L = clone(E.edits.local); const l = L[L.length - 1]; l.name = a === 'dodge' ? '加亮（Dodge）' : '加深（Burn）'; l.exp = a === 'dodge' ? 35 : -35; setEdit({ local: L }, { label: l.name }); renderTools(); return; }
     if (a === 'sunPick') { E.sunMode = true; toast('在照片上點一下太陽（或光源）的位置'); if (!E.edits.rays) setEdit({ rays: 50 }, { label: '陽光光束' }); renderTools(); return; }
     if (a === 'lutPick') { const f = await api.pickSky('lut'); if (!f) return; setEdit({ lutPath: fileURL(f), lutAmt: E.edits.lutAmt || 100 }, { label: '載入 LUT' }); renderTools(); return; }
     if (a === 'lutOff') { setEdit({ lutPath: null }, { label: '移除 LUT' }); renderTools(); return; }
-    if (a === 'brushPaint' || a === 'brushErase') { const er = a === 'brushErase'; if (E.brushMode && E.brush.erase === er) setBrushMode(false); else { E.brush.erase = er; setBrushMode(true); } renderTools(); return; }
+    if (a === 'brushPaint' || a === 'brushErase') { const er = a === 'brushErase'; if (E.brushMode && E.brushTarget === 'layer' && E.brush.erase === er) setBrushMode(false); else { E.brush.erase = er; setBrushMode(true, 'layer'); } renderTools(); return; }
     if (a === 'layerInv') { const L = clone(E.edits.local); L[E.layerSel].inv = !L[E.layerSel].inv; setEdit({ local: L }, { label: '反轉範圍' }); renderTools(); return; }
     if (a === 'layerShow') { E.showMask = !E.showMask; renderTools(); draw(); return; }
     if (a === 'layerClear') { const L = clone(E.edits.local); L[E.layerSel].strokes = []; setEdit({ local: L }, { label: '清除筆畫' }); renderTools(); return; }
     if (a === 'layerRename') { const L = clone(E.edits.local); const n = await askText('圖層名稱', '名稱', layerName(L[E.layerSel])); if (n) { L[E.layerSel].name = n; setEdit({ local: L }, { label: '圖層改名' }); renderTools(); } return; }
     if (t.dataset.delheal) { const H = [...E.edits.heal]; H.splice(+t.dataset.delheal, 1); setEdit({ heal: H }, { label: '刪除修補' }); refreshHeal(); renderTools(); }
-    if (t.dataset.rstg != null) { resetGroup(GROUPS[E.tab][+t.dataset.rstg]); return; }
+    if (t.dataset.rstg != null) { const [tb, gi] = t.dataset.rstg.split(':'); resetGroup(GROUPS[tb][+gi]); return; }
     if (t.dataset.rstk) { resetKeys([t.dataset.rstk], '重設 ' + (t.closest('.sl')?.querySelector('label')?.textContent || '')); return; }
     if (t.dataset.mist) { setEdit({ mist: +t.dataset.mist }, { label: '黑柔濾鏡 ' + t.textContent }); renderTools(); }
     if (a === 'mistWarm') { setEdit({ mistWarm: E.edits.mistWarm === false }, { label: '暖色光暈' }); renderTools(); }
@@ -1688,6 +2131,7 @@ function bindGlobal() {
     if (a === 'focusClear') { setEdit({ focus: null }, { label: '取消焦點' }); renderTools(); }
     if (a === 'healToggle') { E.healMode = !E.healMode; layoutCanvas(); draw(); renderTools(); }
     if (a === 'autoLines') autoLines();
+    if (t.dataset.skyph) { setEdit({ skyType: 'custom', skyImg: `app://bundle/models/skies/${t.dataset.skyph}.jpg`, skyRep: E.edits.skyRep || 100 }, { label: '天空：' + t.textContent }); renderTools(); return; }
     if (t.dataset.skytype) {
       if (t.dataset.skytype === 'custom') { const f = await api.pickSky(); if (!f) return; setEdit({ skyType: 'custom', skyImg: fileURL(f), skyRep: E.edits.skyRep || 100 }, { label: '自訂天空' }); renderTools(); return; }
       setEdit({ skyType: t.dataset.skytype, skyRep: E.edits.skyRep || 100 }, { label: '天空替換' }); renderTools(); }
@@ -1701,7 +2145,7 @@ function bindGlobal() {
     if (a === 'bw') { setEdit({ bw: !E.edits.bw }, { label: '黑白' }); renderTools(); }
     if (a === 'curveReset') { setEdit({ curve: DEFAULT_EDITS().curve }, { label: '曲線重設' }); drawCurve(); }
     if (a === 'resetAll') { setEdit({ ...DEFAULT_EDITS() }, { label: '重設全部' }); engine.setPins([]); layoutCanvas(); renderTools(); }
-    if (a === 'resetTab') { const d = DEFAULT_EDITS(); const keys = E.tab === 'crop' ? ['crop'] : GROUPS[E.tab].flatMap(g => (g.items || []).map(i => i.key).concat(g.hsl ? ['hslH', 'hslS', 'hslL'] : [], g.curve ? ['curve'] : [], g.bw ? ['bw'] : [], g.skyRep ? ['skyRep', 'skyType', 'skyImg', 'skyX', 'skyHorizon', 'skyBlend', 'skyBlur', 'skyExp', 'skyTemp', 'skyRelight', 'skyHaze', 'skyDetail', 'skyReflect'] : [], g.cm ? ['cm', 'cmAmt'] : [])); const patch = {}; keys.forEach(k => patch[k] = d[k]); setEdit(patch, { label: '重設分頁' }); engine.setPins(pinsFor(E.masks?.pins, E.edits)); renderTools(); }
+    if (a === 'resetTab') { const RT = t.dataset.rt || E.tab; const d = DEFAULT_EDITS(); const keys = RT === 'crop' ? ['crop'] : GROUPS[RT].flatMap(g => (g.items || []).map(i => i.key).concat(g.hsl ? ['hslH', 'hslS', 'hslL'] : [], g.curve ? ['curve'] : [], g.bw ? ['bw'] : [], g.skyRep ? ['skyRep', 'skyType', 'skyImg', 'skyX', 'skyHorizon', 'skyBlend', 'skyBlur', 'skyExp', 'skyTemp', 'skyRelight', 'skyHaze', 'skyDetail', 'skyReflect'] : [], g.cm ? ['cm', 'cmAmt'] : [])); const patch = {}; keys.forEach(k => patch[k] = d[k]); setEdit(patch, { label: '重設分頁' }); engine.setPins(pinsFor(E.masks?.pins, E.edits)); renderTools(); }
     if (a === 'cropToggle') { E.crop = !E.crop; layoutCanvas(); draw(); renderTools(); }
     if (a === 'cropReset') { setEdit({ crop: DEFAULT_EDITS().crop }, { label: '重設裁切' }); renderTools(); }
     if (a === 'cropRotate') {
@@ -1725,6 +2169,7 @@ function bindGlobal() {
   $('#editBar').addEventListener('click', (e) => {
     const id = e.target.closest('[id]')?.id;
     if (id === 'tBefore') toggleSplit();
+    if (id === 'tSbs') toggleSbs();
     if (id === 'tZoom') { E.zoom = E.zoom === 'fit' ? '100' : 'fit'; layoutCanvas(); draw(); renderEditBar(); }
     if (id === 'tUndo') undo(); if (id === 'tRedo') redoFn();
     if (id === 'tCopy') copySettings();
@@ -1737,12 +2182,36 @@ function bindGlobal() {
     if (e.shiftKey) { const list = filtered(); const a = list.findIndex(p => p.id === E.photo.id), b = list.findIndex(p => p.id === id); for (let i = Math.min(a, b); i <= Math.max(a, b); i++) S.sel.add(list[i].id); renderFilm(); renderEditBar(); return; }
     S.sel.clear(); openEdit(id);
   });
+  $('#btnSettings').onclick = () => settingsDialog(); bindFloatPanels(); bindGrad(); bindWheels();
+  // 滑鼠滾輪：停在滑桿上直接調整數值；筆刷模式在畫面上調整筆刷大小
+  document.addEventListener('wheel', (e) => {
+    const r = e.target.closest && e.target.closest('input[type=range]');
+    if (r && !r.disabled) {
+      e.preventDefault(); const min = +r.min, max = +r.max, st = +(r.step || 1) || 1; const big = Math.max(st, (max - min) / 100);
+      const d = (e.deltaY < 0 ? 1 : -1) * (e.shiftKey ? st : e.altKey ? big * 5 : big);
+      const nv = Math.max(min, Math.min(max, Math.round((+r.value + d) / st) * st)); if (nv === +r.value) return;
+      r.value = nv; r.dispatchEvent(new Event('input', { bubbles: true })); clearTimeout(r._wt); r._wt = setTimeout(() => r.dispatchEvent(new Event('change', { bubbles: true })), 350); return;
+    }
+    if (S.view === 'edit' && E.brushMode && e.target.closest && e.target.closest('#viewer')) {
+      e.preventDefault(); E.brush.size = Math.max(0.002, Math.min(0.3, E.brush.size * (e.deltaY < 0 ? 1.12 : 0.89)));
+      const b = $('#brSize'); if (b) { b.value = Math.round(E.brush.size * 1000); $('#brSizeV').textContent = b.value; } updBrushCursor(); return;
+    }
+  }, { passive: false });
+  $('#film').addEventListener('contextmenu', (e) => {
+    const t = e.target.closest('[data-fid]'); if (!t) return; e.preventDefault(); const id = t.dataset.fid;
+    if (!S.sel.has(id)) { S.sel.clear(); S.sel.add(id); if (E.photo) S.sel.add(E.photo.id); if (id !== E.photo?.id) S.sel.delete(E.photo.id); }
+    const ids = S.sel.size > 1 && S.sel.has(id) ? [...S.sel] : [id];
+    showMenu(e.clientX, e.clientY, contextMenuFor('film', ids, e));
+  });
   $('#film').addEventListener('wheel', (e) => { if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) { $('#film').scrollLeft += e.deltaY; e.preventDefault(); } }, { passive: false });
   // 畫面縮放 / 拖曳
   let pan = null;
   $('#cv').addEventListener('pointerdown', (e) => {
     if (E.crop) return;
     if (E.focusMode) { pickFocus(e); return; }
+    if (E.pcDrop) { E.pcDrop = false; const cv = $('#cv'); const r = cv.getBoundingClientRect(); const x = Math.round((e.clientX - r.left) / r.width * cv.width), y = Math.round((e.clientY - r.top) / r.height * cv.height); const gl = engine.gl; const px = new Uint8Array(4); gl.readPixels(x, cv.height - 1 - y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      const mx = Math.max(px[0], px[1], px[2]), mn = Math.min(px[0], px[1], px[2]); let h = 0; if (mx !== mn) { const d = mx - mn; h = mx === px[0] ? ((px[1] - px[2]) / d) % 6 : mx === px[1] ? (px[2] - px[0]) / d + 2 : (px[0] - px[1]) / d + 4; h = (h * 60 + 360) % 360; }
+      const P = [...(E.edits.pointColors || [])]; if (P.length >= 4) P.shift(); P.push({ h: Math.round(h), range: 30, dh: 0, ds: 0, dl: 0 }); E.pcSel = P.length - 1; setEdit({ pointColors: P }, { label: '點顏色吸色' }); renderTools(); return; }
     if (E.sunMode) { const [x, y] = screenToSrc(e); E.sunMode = false; setEdit({ sun: { x: +x.toFixed(4), y: +y.toFixed(4) } }, { label: '太陽位置' }); return; }
     if (E.brushMode && !E.spaceDown && e.button === 0) { brushDown(e); return; }
     if (E.healMode) { healDown(e); return; }
@@ -1795,13 +2264,17 @@ function bindGlobal() {
     else if (k.toLowerCase() === 'g' || (k === 'Escape' && S.view === 'edit' && !E.crop)) switchView('lib');
     else if (k === 'Escape' && E.crop) { E.crop = false; layoutCanvas(); draw(); renderTools(); }
     else if (k === '\\' && S.view === 'edit') toggleSplit();
+    else if (k.toLowerCase() === 'y' && !ctrl && S.view === 'edit') toggleSbs();
     else if (k.toLowerCase() === 'c' && S.view === 'lib' && S.libMode !== 'grid') { S.libMode = 'compare'; renderLibBar(); renderGrid(); }
   });
 }
-function toggleSplit() { E.split = E.split == null ? 0.5 : null; positionSplit(); draw(); renderEditBar(); }
-function copySettings() {
-  const p = S.view === 'edit' ? null : photoById(S.focus);
-  const e = S.view === 'edit' ? clone(E.edits) : { ...DEFAULT_EDITS(), ...clone(p?.edits || {}) };
+function toggleSplit() { E.split = E.split == null ? 0.5 : null; if (E.split != null && E.sbs) { E.sbs = false; layoutCanvas(); } positionSplit(); draw(); renderEditBar(); }
+// 左右雙畫面：左邊修圖前、右邊修圖後，縮放與位置同步
+function toggleSbs() { E.sbs = !E.sbs; if (E.sbs) E.split = null; $('#cv0wrap').classList.toggle('hidden', !E.sbs); layoutCanvas(); draw(); renderEditBar(); positionSplit(); }
+function copySettings(fromId) {
+  const useEdit = S.view === 'edit' && (!fromId || fromId === E.photo?.id);
+  const p = useEdit ? null : photoById(fromId || S.focus);
+  const e = useEdit ? clone(E.edits) : { ...DEFAULT_EDITS(), ...clone(p?.edits || {}) };
   S.clipboard = e; toast('已複製修圖設定（不含裁切）'); if (S.view === 'lib') renderInfo();
 }
 function pasteSettings(ids) {
