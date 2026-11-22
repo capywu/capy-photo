@@ -79,23 +79,30 @@ precision highp float; precision highp usampler2D;
 in vec2 uv; out vec4 o;
 uniform usampler2D uSrc; uniform vec2 uSrcSize; uniform vec3 uMul; uniform float uScale; uniform int uIsSRGB;
 uniform sampler2D uPM; uniform int uHasPM;
+uniform sampler2D uPlate; uniform int uHasPlate; uniform vec4 uPlateR; uniform int uPlateLin;
 ${WARP}
 vec3 fetch(ivec2 p){ p = clamp(p, ivec2(0), ivec2(uSrcSize)-1); vec3 c = vec3(texelFetch(uSrc, p, 0).rgb) * uScale;
   if(uIsSRGB==1) c = mix(c/12.92, pow((c+0.055)/1.055, vec3(2.4)), step(0.04045, c)); return c; }
 vec3 samp(vec2 u){ vec2 q = u * uSrcSize - 0.5; ivec2 i0 = ivec2(floor(q)); vec2 f = fract(q);
   return mix(mix(fetch(i0), fetch(i0+ivec2(1,0)), f.x), mix(fetch(i0+ivec2(0,1)), fetch(i0+ivec2(1,1)), f.x), f.y); }
+vec3 plateSamp(vec2 r){ vec3 p = texture(uPlate, r).rgb; if(uPlateLin == 1) return pow(p, vec3(2.2)); if(uIsSRGB == 1) return mix(p/12.92, pow((p+0.055)/1.055, vec3(2.4)), step(0.04045, p)); return p; }
 void main(){
   vec2 wq = warpUV(uv);
   vec3 c = samp(wq);
   // 身形調整只移動人物：背景維持原位，人物收窄後露出的地方用身體邊緣外側的背景鏡射補上
   vec4 br = bodyRow(uv.y);
-  if(uHasPM == 1 && br.w > 0. && br.z != 0. && abs(uv.x - br.x) < br.y * 3.2){
+  bool bodyHit = br.w > 0. && br.z != 0. && abs(uv.x - br.x) < br.y * 3.2;
+  vec2 pr = (uv - uPlateR.xy) / uPlateR.zw; bool inPlate = uHasPlate == 1 && pr.x >= 0. && pr.y >= 0. && pr.x <= 1. && pr.y <= 1.;
+  bool moved = length((wq - uv) * uSrcSize) > 0.25;
+  if(uHasPM == 1 && (bodyHit || (moved && inPlate))){
     float aNew = smoothstep(0.45, 0.75, texture(uPM, wq).r);
     // 原本人物範圍用「擴張後」的遮罩，連遮罩邊緣沒抓滿的手臂、髮絲也一起換成背景，避免殘影
     float dl = 0.012; float mo = texture(uPM, uv).r; for(int k = 1; k <= 4; k++){ float o2 = dl * float(k) / 4.0; mo = max(mo, max(texture(uPM, uv + vec2(o2, 0.)).r, texture(uPM, uv - vec2(o2, 0.)).r) * (1.0 - float(k) * 0.08)); }
     float aOld = smoothstep(0.2, 0.5, mo);
     vec3 bg = samp(uv);
-    if(aOld > 0.01){
+    // 有 AI 補好的背景（生成式補圖，把人物拿掉後的乾淨背景）就直接用，不再鏡射
+    if(inPlate){ bg = mix(bg, plateSamp(pr), aOld); }
+    else if(aOld > 0.01 && bodyHit){
       float sgn = uv.x >= br.x ? 1.0 : -1.0; float st = 1.5 / uSrcSize.x * max(1.0, uSrcSize.x / 800.0); float e = uv.x;
       for(int k = 0; k < 160; k++){ e += sgn * st; if(texture(uPM, vec2(e, uv.y)).r < 0.12 || e < 0. || e > 1.) break; } e += sgn * 0.012;
       float m = clamp(e + (e - uv.x) + sgn * st * 2.0, 0., 1.);
@@ -105,7 +112,8 @@ void main(){
     }
     // 遮罩不確定的地方（手臂貼著身體、顏色接近背景）不做合成，改用一般液化，避免撕裂與殘影
     float m1v = texture(uPM, uv).r, m2v = texture(uPM, wq).r; float conf = min(abs(m1v * 2.0 - 1.0), abs(m2v * 2.0 - 1.0));
-    c = mix(c, mix(bg, c, aNew), smoothstep(0.45, 0.85, conf));
+    if(inPlate) c = mix(bg, c, smoothstep(0.35, 0.7, m2v));
+    else c = mix(c, mix(bg, c, aNew), smoothstep(0.45, 0.85, conf));
   }
   o = vec4(c * uMul, 1.0);
 }`;
@@ -673,7 +681,10 @@ void main(){
     float hl2 = lum(d); float rel = pow(clamp(hl2 / max(uHairRefL, 0.03), 0., 4.), 0.85);
     vec3 tgt = clamp(uHairCol * rel, 0., 1.); tgt += max(hl2 - 0.85, 0.) * 0.8;
     vec3 nd = mix(d, mix(d, tgt, 0.9), uHairAmt); nd *= 1.0 + uHairLum * 0.45;
-    d = mix(d, clamp(nd,0.,1.), m4.r);
+    // 遮罩邊緣（髮絲之間）透出的白衣服、天空等：比頭髮亮很多又不飽和的像素不換色，避免染到背景
+    float mxc = max(d.r, max(d.g, d.b)); float sat = (mxc - min(d.r, min(d.g, d.b))) / max(mxc, 0.02);
+    float protect = smoothstep(1.9, 3.3, hl2 / max(uHairRefL, 0.03)) * (1.0 - smoothstep(0.18, 0.45, sat));
+    d = mix(d, clamp(nd,0.,1.), m4.r * (1.0 - protect * (1.0 - smoothstep(0.85, 1.0, m4.r) * 0.5)));
   }
   // 水面
   if(m4.g > 0.002 && (uWater != 0. || uWaterCol != 0.)){
@@ -964,8 +975,12 @@ export class Engine {
     this.params(gl.NEAREST);
     this.srcW = src.width; this.srcH = src.height; this.srcSRGB = !!src.srgb;
     this.dirty = true; this.origDirty = true;
-    this.setMasks(null); this.pins = [];
+    this.setMasks(null); this.pins = []; this.setPlate(null);
   }
+  // 身形 / 瘦臉用的乾淨背景（人物範圍以生成式 AI 補好）
+  setPlate(pl) { const gl = this.gl; if (this.plateTex) { gl.deleteTexture(this.plateTex); this.plateTex = null; }
+    if (pl) { this.plateTex = this.texRGBA8(pl.pw, pl.ph, pl.data); gl.bindTexture(gl.TEXTURE_2D, this.plateTex); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); this.plateR = [pl.x, pl.y, pl.w, pl.h]; this.plateLin = pl.lin; }
+    this.dirty = true; }
   updateSource(src) { // 修補後重新上傳，保留 AI 遮罩
     const gl = this.gl; gl.bindTexture(gl.TEXTURE_2D, this.srcTex); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     if (src.data instanceof Uint16Array) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB16UI, src.width, src.height, 0, gl.RGB_INTEGER, gl.UNSIGNED_SHORT, src.data);
@@ -1027,10 +1042,10 @@ export class Engine {
     const P = this.P.base;
     const w0 = this.target('W', W, H);
     this.draw(P, w0.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, mul); this.warpUniforms(P);
-    this.bind(P, 'uPM', 1, this.hasMask ? this.m2 : this.emptyMask); gl.uniform1i(P.u.uHasPM, this.hasMask && this.body ? 1 : 0); this.quad();
+    this.bind(P, 'uPM', 1, this.hasMask ? this.m2 : this.emptyMask); gl.uniform1i(P.u.uHasPM, this.hasMask ? 1 : 0); this.bind(P, 'uPlate', 2, this.plateTex || this.emptyMask); gl.uniform1i(P.u.uHasPlate, this.plateTex && this.hasMask ? 1 : 0); const R = this.plateR || [0, 0, 1, 1]; gl.uniform4f(P.u.uPlateR, R[0], R[1], R[2], R[3]); gl.uniform1i(P.u.uPlateLin, this.plateLin ? 1 : 0); this.quad();
     this.origDirty = true;
     if (this.origDirty) {
-      const o = this.target('O', W, H); this.draw(P, o.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, [1, 1, 1]); gl.uniform1i(P.u.uPins, 0); gl.uniform1i(P.u.uBodyN, 0); gl.uniform1i(P.u.uHasPM, 0); this.quad();
+      const o = this.target('O', W, H); this.draw(P, o.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, [1, 1, 1]); gl.uniform1i(P.u.uPins, 0); gl.uniform1i(P.u.uBodyN, 0); gl.uniform1i(P.u.uHasPM, 0); gl.uniform1i(P.u.uHasPlate, 0); this.quad();
       this.origDirty = false;
     }
     if (e.defocus > 0) {

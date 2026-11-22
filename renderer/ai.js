@@ -249,12 +249,12 @@ export async function buildMasks(imgData) {
     }
   }
   // ── 頭髮：頭部範圍內、人物遮罩內、顏色接近頭頂取樣的頭髮色 ──
-  const hairA = new Float32Array(W * H);
+  const hairA = new Float32Array(W * H), faceP = new Float32Array(W * H), skinP = new Float32Array(W * H);
   // 先用臉部解析神經網路找整片頭髮（含兩側、馬尾、長髮）；失敗才用顏色模型
   let parsed = false;
   for (const f of faces) {
     try { const m = f.mesh; let bx = [1e9, 1e9, -1e9, -1e9]; for (const p of m) { bx[0] = Math.min(bx[0], p[0]); bx[1] = Math.min(bx[1], p[1]); bx[2] = Math.max(bx[2], p[0]); bx[3] = Math.max(bx[3], p[1]); }
-      await parseHair(imgData, W, H, bx, hairA); parsed = true; } catch (err) { console.warn('hair parse', err); }
+      await parseHair(imgData, W, H, bx, hairA, faceP, skinP); parsed = true; } catch (err) { console.warn('hair parse', err); }
   }
   if (parsed && person) for (let i = 0; i < W * H; i++) { const pv = person[i * 4 + 3] / 255; hairA[i] = Math.min(1, Math.max(0, (hairA[i] - 0.25) / 0.5)) * Math.min(1, 0.35 + pv * 1.2); }
   else if (parsed) for (let i = 0; i < W * H; i++) hairA[i] = Math.min(1, Math.max(0, (hairA[i] - 0.25) / 0.5));
@@ -294,12 +294,14 @@ export async function buildMasks(imgData) {
     // 頭髮顏色模型：用最確定是頭髮的像素建立顏色分布，差太多的（例如撥頭髮的手、肩膀）排除
     if (parsed) { let n = 0; const m = [0, 0, 0], q = [0, 0, 0];
       for (let i = 0; i < W * H; i++) if (hairA[i] > 0.85) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); for (let k = 0; k < 3; k++) { m[k] += c[k]; q[k] += c[k] * c[k]; } n++; }
-      if (n > 200) { const sd = [0, 1, 2].map(k => Math.max([32, 6, 6][k], Math.sqrt(Math.max(0, q[k] / n - (m[k] / n) ** 2)))); for (let k = 0; k < 3; k++) m[k] /= n;
+      if (n > 200) { const sd = [0, 1, 2].map(k => Math.max([40, 10, 10][k], Math.sqrt(Math.max(0, q[k] / n - (m[k] / n) ** 2)))); for (let k = 0; k < 3; k++) m[k] /= n;
         for (let i = 0; i < W * H; i++) { if (!hairA[i]) continue; const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]);
-          const z = Math.sqrt(((c[0] - m[0]) / (sd[0] * 1.4)) ** 2 + ((c[1] - m[1]) / sd[1]) ** 2 + ((c[2] - m[2]) / sd[2]) ** 2); const k2 = Math.min(1, Math.max(0, 1 - (z - 2.4) / 1.4));
+          const z = Math.sqrt(((c[0] - m[0]) / (sd[0] * 1.4)) ** 2 + ((c[1] - m[1]) / sd[1]) ** 2 + ((c[2] - m[2]) / sd[2]) ** 2); const k2 = Math.max(Math.min(1, Math.max(0, 1 - (z - 3.0) / 1.6)), hairA[i] > 0.9 ? 0.85 : 0);
           hairA[i] *= k2; hairK[i] *= k2; } } } }
   let hair = hairA;
   if (faces.length && person) { hair = guidedFilter(gray, hairA, W, H, Math.max(2, Math.round(Math.max(W, H) / 300)), 4e-4); for (let i = 0; i < W * H; i++) hair[i] *= hairK[i]; }
+  // 臉部範圍：用臉部解析的結果（自動排除瀏海、頭髮、耳朵），邊緣依照片細節貼齊
+  let faceR = null; if (parsed) { const fp = new Float32Array(W * H); for (let i = 0; i < W * H; i++) fp[i] = Math.min(1, Math.max(0, (faceP[i] - 0.3) / 0.4)) * (1 - Math.min(1, hair[i] * 1.3)); faceR = guidedFilter(gray, fp, W, H, Math.max(2, Math.round(Math.max(W, H) / 400)), 2e-3); }
 
   // ── 身形：人物輪廓（含衣服）逐列量測軀幹中心與寬度，姿勢模型輔助定位肩、髖、膝（正面、側面都可）──
   let bodyProf = null;
@@ -381,7 +383,7 @@ export async function buildMasks(imgData) {
       const p = person[i * 4 + 3] / 255; if (p < 0.3) continue;
       const [Y, Cb, Cr] = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]);
       const dc = Math.hypot(Cb - rCb, Cr - rCr);
-      const s = Math.max(0, 1 - dc / 14) * Math.min(1, Y / 40) * p;
+      const s = Math.max(0, 1 - dc / 14) * Math.min(1, Y / 40) * p * (1 - Math.min(1, hair[i] * 1.5));
       const v = Math.max(sk[i * 4 + 3] * (sk[i * 4] / 255), s * 230);
       sk[i * 4] = 255; sk[i * 4 + 3] = v; sk[i * 4 + 1] = sk[i * 4 + 2] = 255;
     }
@@ -394,11 +396,12 @@ export async function buildMasks(imgData) {
   const lp = gd(lpX), br = gd(brX), fc = gd(fcX), bl = gd(blX), hi = gd(hiX), lo = gd(loX);
   const m1 = new Uint8Array(W * H * 4), m2 = new Uint8Array(W * H * 4), m3 = new Uint8Array(W * H * 4), m4 = new Uint8Array(W * H * 4);
   const A = (d, i) => d[i * 4 + 3] * (d[i * 4] / 255);
+  const noHair = (i) => 1 - Math.min(1, hair[i] * 1.4);
   for (let i = 0; i < W * H; i++) {
-    m1[i * 4] = A(sk, i); m1[i * 4 + 1] = A(ue, i); m1[i * 4 + 2] = A(th, i); m1[i * 4 + 3] = A(ey, i);
+    m1[i * 4] = A(sk, i) * noHair(i); m1[i * 4 + 1] = A(ue, i); m1[i * 4 + 2] = A(th, i); m1[i * 4 + 3] = A(ey, i);
     m2[i * 4] = person ? person[i * 4 + 3] : 0; m2[i * 4 + 1] = sky[i]; m2[i * 4 + 2] = A(hi, i); m2[i * 4 + 3] = A(lo, i);
     m4[i * 4] = hair[i] * 255; m4[i * 4 + 1] = water[i]; m4[i * 4 + 3] = sky.region ? sky.region[i] : 0;
-    m3[i * 4] = A(lp, i); m3[i * 4 + 1] = A(br, i); m3[i * 4 + 2] = A(fc, i); m3[i * 4 + 3] = A(bl, i);
+    m3[i * 4] = A(lp, i); m3[i * 4 + 1] = A(br, i); m3[i * 4 + 2] = faceR ? Math.max(0, Math.min(1, faceR[i])) * 255 : A(fc, i); m3[i * 4 + 3] = A(bl, i);
   }
   let skinRef = null;
   if (skinSamples.length) { const r = skinSamples.reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], [0, 0, 0]).map(v => Math.pow(v / skinSamples.length / 255, 2.2)); skinRef = r; }

@@ -582,7 +582,7 @@ async function loadMasks(token) {
     if (token !== E.decodeToken) return;
     E.masks = m; engine.setMasks(applyMaskFix(m, E.edits.maskFix)); engine.setPins(pinsFor(m.pins, E.edits));
     if (E.edits.enhance && !E.edits.enhanceVec) { E.edits.enhanceVec = enhanceVector(engine, E.edits, m); persistEdits(); }
-    E.maskState = 'ready'; renderTools();
+    E.maskState = 'ready'; renderTools(); ensurePlate();
   } catch (err) { console.warn('masks', err); E.maskState = 'error'; }
   renderMaskStatus(); draw();
 }
@@ -624,7 +624,7 @@ function draw() {
     const e = E.hover ? E.hover : E.edits;
     const ed = E.crop ? { ...e, crop: fullFrame(e.crop.angle) } : E.healMode ? { ...e, crop: { cx: .5, cy: .5, w: 1, h: 1, angle: 0 } } : e;
     if (E.sbs && !E.crop && !E.healMode) { engine.render(ed, { view: E.view, split: 2, noPost: true }); const c0 = $('#cv0'); const x0 = c0.getContext('2d'); x0.drawImage($('#cv'), 0, 0, c0.width, c0.height); }
-    engine.render(ed, { view: E.view, split: E.sbs ? null : E.split, showLayer: E.showMask && (tabVisible('layers') || tabVisible('basic')) && !E.hover ? (E.layerSel ?? -1) : -1, showMask: E.maskShow && tabVisible('ai') && !E.hover ? (MASK_CH.find(c => c[0] === (E.maskSel || 'skin'))) : null });
+    engine.render(ed, { view: E.view, split: E.sbs ? null : E.split, showLayer: (E.showMask || (E.altPeek && !peekMaskFix())) && (tabVisible('layers') || tabVisible('basic')) && !E.hover ? (E.layerSel ?? -1) : -1, showMask: (E.maskShow || (E.altPeek && peekMaskFix())) && tabVisible('ai') && !E.hover ? (MASK_CH.find(c => c[0] === (E.maskSel || 'skin'))) : null });
     histSoon();
   });
 }
@@ -644,7 +644,8 @@ let saveT = 0, histPushT = 0;
 function setEdit(patch, opts = {}) {
   if (!opts.noUndo) { clearTimeout(histPushT); if (!E.pendingUndo) { E.pendingUndo = clone(E.edits); } histPushT = setTimeout(() => { E.undo.push(E.pendingUndo); E.pendingUndo = null; E.redo = []; if (E.undo.length > 100) E.undo.shift(); renderHistory(opts.label); }, 350); }
   Object.assign(E.edits, patch);
-  if ('slim' in patch || 'eyeEnlarge' in patch || 'waist' in patch || 'bodySlim' in patch) engine.setPins(pinsFor(E.masks?.pins, E.edits));
+  if ('slim' in patch || 'eyeEnlarge' in patch || 'waist' in patch || 'bodySlim' in patch) { engine.setPins(pinsFor(E.masks?.pins, E.edits)); ensurePlate(); }
+  if ('maskFix' in patch) ensurePlate();
   if ('crop' in patch) layoutCanvas();
   if ('maskFix' in patch && E.masks) engine.setMasks(applyMaskFix(E.masks, E.edits.maskFix));
   if (('deblur' in patch || 'aiDenoise' in patch) && !opts.noDeblur) scheduleDeblur();
@@ -1018,7 +1019,7 @@ function localToolsHTML() {
     <div class="sl"><label>筆刷大小</label><input type="range" id="brSize" min="2" max="300" value="${Math.round(B.size * 1000)}"><em id="brSizeV">${Math.round(B.size * 1000)}</em></div>
     <div class="sl"><label>羽化</label><input type="range" id="brFeather" min="0" max="100" value="${Math.round(B.f * 100)}"><em>${Math.round(B.f * 100)}</em></div>
     <div class="sl"><label>流量</label><input type="range" id="brFlow" min="5" max="100" value="${Math.round(B.flow * 100)}"><em>${Math.round(B.flow * 100)}</em></div>
-    <div class="hint">開啟筆刷後直接在照片上塗抹（可先放大畫面細修）；[ ] 鍵調整筆刷大小，按住 Alt 暫時切換橡皮擦。</div>
+    <div class="hint">開啟筆刷後直接在照片上塗抹（可先放大畫面細修）；[ ] 鍵調整筆刷大小，按住 Ctrl 暫時切換橡皮擦，按住 Alt 顯示範圍（放開就消失）。</div>
     ${cur.mask === 'radial' ? `<div class="sl"><label>羽化</label><input type="range" data-lgeo="f" min="0" max="100" value="${cur.geo?.f ?? 50}"><em>${cur.geo?.f ?? 50}</em></div><div class="sl"><label>旋轉</label><input type="range" data-lgeo="rot" min="-180" max="180" value="${Math.round((cur.geo?.rot || 0) * 180 / Math.PI)}"><em>${Math.round((cur.geo?.rot || 0) * 180 / Math.PI)}°</em></div>` : ''}
     ${cur.mask === 'linear' || cur.mask === 'radial' ? '<div class="hint">在照片上拖曳控制點調整漸層位置、大小與方向。</div>' : ''}
     <div class="sl"><label>顏色</label><input type="color" data-ltint="c" value="${cur.tintC || '#ffa040'}" style="width:34px;height:22px;border:0;background:none;padding:0"><input type="range" data-lk="tintA" data-li="${E.layerSel}" min="0" max="100" value="${cur.tintA || 0}"><em>${cur.tintA || 0}</em></div>
@@ -1386,7 +1387,7 @@ function updBrushCursor(ev) {
 }
 let brushSt = null;
 function brushDown(ev) {
-  brushSt = { pts: [screenToSrc(ev)], r: E.brush.size, f: E.brush.f, flow: E.brush.flow, erase: E.brush.erase !== ev.altKey };
+  brushSt = { pts: [screenToSrc(ev)], r: E.brush.size, f: E.brush.f, flow: E.brush.flow, erase: E.brush.erase !== (ev.ctrlKey || ev.metaKey) };
   $('#cv').setPointerCapture(ev.pointerId);
   if (E.brushTarget === 'mask') { liveMask(); return; }
   const L = E.edits.local || []; const l = L[E.layerSel]; if (!l) { brushSt = null; return; }
@@ -1428,6 +1429,8 @@ function healCanvas() {
   o.width = Math.round(r.width); o.height = Math.round(r.height); return o;
 }
 function healPos(e) { const r = $('#cv').getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; }
+// 按住 Alt：暫時顯示目前筆刷 / AI 範圍；AI 範圍修正筆刷、或沒有選圖層時顯示 AI 範圍
+function peekMaskFix() { return (E.brushMode && E.brushTarget === 'mask') || ((E.layerSel == null || !(E.edits.local || [])[E.layerSel]) && tabVisible('ai')); }
 function healDown(e) {
   if (E.selectMode) { const o = healCanvas(); healStroke = { pts: [healPos(e)], r: E.healR }; $('#cv').setPointerCapture(e.pointerId); paintStroke(o); return; }
   const md = E.healTool || 'remove';
@@ -1562,6 +1565,64 @@ async function toggleMic() {
   try { const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }); const ctx = new AudioContext({ sampleRate: 16000 }); const src = ctx.createMediaStreamSource(stream); const proc = ctx.createScriptProcessor(4096, 1, 1); const chunks = [];
     proc.onaudioprocess = (ev) => chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0))); src.connect(proc); proc.connect(ctx.destination); micState = { stream, ctx, src, proc, chunks }; E.recording = true; renderEditBar(); toast('請說出修圖指令，說完再按一次 🎤'); }
   catch (err) { toast('無法使用麥克風：' + err.message, 5000); }
+}
+
+// ── 瘦臉 / 瘦身的乾淨背景：用生成式 AI（MI-GAN）把人物範圍補成背景，人物收窄後露出的地方直接用補好的背景，不會有白邊或拉扯 ──
+const plateCache = new Map();
+async function ensurePlate(force) {
+  const e = E.edits; if (!E.photo || E.maskState !== 'ready' || !E.masks) return; if (!force && !(e.slim || e.waist || e.bodySlim || e.eyeEnlarge)) return;
+  const id = E.photo.id, key = id + '|' + JSON.stringify(e.maskFix || null);
+  if (E.plateKey === key) return;
+  if (plateCache.has(key)) { engine.setPlate(plateCache.get(key)); E.plateKey = key; draw(); return; }
+  if (E.plateBusy) { E.plateAgain = true; return; } E.plateBusy = true;
+  try { const c = decodeCache.get(id); const pl = await buildPlate(c.src, applyMaskFix(E.masks, e.maskFix));
+    plateCache.set(key, pl); while (plateCache.size > 6) plateCache.delete(plateCache.keys().next().value);
+    if (E.photo?.id === id) { engine.setPlate(pl); E.plateKey = key; draw(); } }
+  catch (err) { console.warn('plate', err); }
+  finally { E.plateBusy = false; toast('✓ 背景已補好，瘦臉瘦身邊緣已更新', 1800); if (E.plateAgain) { E.plateAgain = false; ensurePlate(); } }
+}
+async function buildPlate(src, m) {
+  const W = src.width, H = src.height, ch = src.channels || 3, lin = src.data instanceof Uint16Array, mx = lin ? 65535 : 255;
+  const s = Math.min(1, 1600 / Math.max(W, H)); const w = Math.round(W * s), h = Math.round(H * s);
+  // 8-bit（gamma）工作影像
+  const img = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = ((Math.min(H - 1, Math.floor((y + 0.5) / s)) * W) + Math.min(W - 1, Math.floor((x + 0.5) / s))) * ch, j = (y * w + x) * 4; for (let k = 0; k < 3; k++) { let v = src.data[i + k] / mx; if (lin) v = Math.pow(Math.max(0, v), 1 / 2.2); img[j + k] = v * 255; } img[j + 3] = 255; }
+  // 人物遮罩 → 擴張成要補的範圍
+  const hole0 = new Uint8Array(w * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) hole0[y * w + x] = m.m2[(Math.floor(y / h * m.h) * m.w + Math.floor(x / w * m.w)) * 4] > 38 ? 1 : 0;
+  const r = Math.max(3, Math.round(w * 0.018)); const tmp = new Uint8Array(w * h), hole = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) { let last = -1e9; for (let x = 0; x < w; x++) { if (hole0[y * w + x]) last = x; tmp[y * w + x] = x - last <= r ? 1 : 0; } last = 1e9; for (let x = w - 1; x >= 0; x--) { if (hole0[y * w + x]) last = x; if (last - x <= r) tmp[y * w + x] = 1; } }
+  for (let x = 0; x < w; x++) { let last = -1e9; for (let y = 0; y < h; y++) { if (tmp[y * w + x]) last = y; hole[y * w + x] = y - last <= r ? 1 : 0; } last = 1e9; for (let y = h - 1; y >= 0; y--) { if (tmp[y * w + x]) last = y; if (last - y <= r) hole[y * w + x] = 1; } }
+  let x0 = w, y0 = h, x1 = -1, y1 = -1; const rowW = []; for (let y = 0; y < h; y++) { let n = 0; for (let x = 0; x < w; x++) if (hole[y * w + x]) { n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; } if (n) rowW.push(n); }
+  if (x1 < 0) return null; rowW.sort((a, b) => a - b); const pw = rowW[Math.floor(rowW.length * 0.6)] || w * 0.3;
+  // 先把人物內部用左右兩側背景顏色內插填平（避免 AI 把人物顏色延伸出去），只讓 AI 生成靠近邊緣、瘦身後會露出的那一圈
+  const band = new Uint8Array(w * h); const avg = (y, x0, x1, k) => { let t = 0, n = 0; for (let x = Math.max(0, x0); x <= Math.min(w - 1, x1); x++) { t += img[(y * w + x) * 4 + k]; n++; } return n ? t / n : 128; };
+  for (let y = 0; y < h; y++) { let x = 0; while (x < w) { if (!hole[y * w + x]) { x++; continue; } let b = x; while (b + 1 < w && hole[y * w + b + 1]) b++;
+      const hasL = x > 0, hasR = b < w - 1; const L = [0, 1, 2].map(k => hasL ? avg(y, x - 4, x - 1, k) : avg(y, b + 1, b + 4, k)), R = [0, 1, 2].map(k => hasR ? avg(y, b + 1, b + 4, k) : L[k]);
+      const B = Math.max(r + 6, Math.round((b - x + 1) * 0.3));
+      for (let q = x; q <= b; q++) { const t = (q - x + 0.5) / (b - x + 1); const i = (y * w + q) * 4; for (let k = 0; k < 3; k++) img[i + k] = L[k] + (R[k] - L[k]) * t; if ((hasL && q - x < B) || (hasR && b - q < B)) band[y * w + q] = 1; }
+      x = b + 1; } }
+  // 內插區上下柔化，避免一條條橫紋
+  { const R2 = 6; const col = new Float32Array(h * 3); for (let x = 0; x < w; x++) { for (let y = 0; y < h; y++) for (let k = 0; k < 3; k++) col[y * 3 + k] = img[(y * w + x) * 4 + k]; for (let y = 0; y < h; y++) { const i = y * w + x; if (!hole[i] || band[i]) continue; for (let k = 0; k < 3; k++) { let t = 0, n = 0; for (let d = -R2; d <= R2; d++) { const yy = y + d; if (yy < 0 || yy >= h) continue; t += col[yy * 3 + k]; n++; } img[i * 4 + k] = t / n; } } } }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; if (!hole[i]) continue; let top = y; while (top > 0 && hole[(top - 1) * w + x] && y - top < r + 6) top--; if (top > 0 && !hole[(top - 1) * w + x] && y - top < r + 6) band[i] = 1; }
+  // 分塊補圖：每塊大約一個人身寬，邊緣兩側都有背景可參考
+  const T = Math.round(Math.min(w, h, Math.max(256, Math.min(640, pw * 0.9)))); const step = Math.max(64, Math.round(T * 0.5));
+  const acc = new Float32Array(w * h * 3), wt = new Float32Array(w * h); const N = 512;
+  const cc = new OffscreenCanvas(T, T), cx = cc.getContext('2d', { willReadFrequently: true }); const rc = new OffscreenCanvas(N, N), rx = rc.getContext('2d', { willReadFrequently: true }); rx.imageSmoothingQuality = 'high';
+  const bc = new OffscreenCanvas(N, N), bx = bc.getContext('2d'); const oc = new OffscreenCanvas(T, T), ox = oc.getContext('2d', { willReadFrequently: true }); ox.imageSmoothingQuality = 'high';
+  const tiles = []; for (let ty = Math.max(0, y0 - T / 4); ty < y1; ty += step) for (let tx = Math.max(0, x0 - T / 4); tx < x1; tx += step) tiles.push([Math.round(Math.min(Math.max(0, tx), w - T)), Math.round(Math.min(Math.max(0, ty), h - T))]);
+  let done = 0;
+  for (const [tx, ty] of tiles) {
+    let cnt = 0; for (let y = ty; y < ty + T; y += 4) for (let x = tx; x < tx + T; x += 4) cnt += band[y * w + x]; done++; if (!cnt) continue;
+    toast(`AI 正在補人物後方的背景 ${Math.round(done / tiles.length * 100)}%（完成後瘦臉瘦身邊緣會自動變乾淨，可以繼續修圖）`, 60000);
+    const crop = new ImageData(T, T); for (let y = 0; y < T; y++) crop.data.set(img.subarray(((ty + y) * w + tx) * 4, ((ty + y) * w + tx + T) * 4), y * T * 4);
+    cx.putImageData(crop, 0, 0); rx.drawImage(cc, 0, 0, N, N); const ci = rx.getImageData(0, 0, N, N);
+    const hm = new Float32Array(N * N); for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) hm[y * N + x] = band[(ty + Math.min(T - 1, Math.floor(y / N * T))) * w + tx + Math.min(T - 1, Math.floor(x / N * T))];
+    const out = await inpaintAI(ci, hm); bx.putImageData(out, 0, 0); ox.clearRect(0, 0, T, T); ox.drawImage(bc, 0, 0, T, T); const od = ox.getImageData(0, 0, T, T).data;
+    for (let y = 0; y < T; y++) for (let x = 0; x < T; x++) { const i = (ty + y) * w + tx + x; if (!band[i]) continue; const f = Math.max(0.02, Math.min(1, Math.min(x, y, T - 1 - x, T - 1 - y) / (T * 0.2) )); const j = (y * T + x) * 4; acc[i * 3] += od[j] * f; acc[i * 3 + 1] += od[j + 1] * f; acc[i * 3 + 2] += od[j + 2] * f; wt[i] += f; }
+  }
+  const PX = Math.max(0, x0 - 2), PY = Math.max(0, y0 - 2), PW = Math.min(w, x1 + 3) - PX, PH = Math.min(h, y1 + 3) - PY; const data = new Uint8Array(PW * PH * 4);
+  for (let y = 0; y < PH; y++) for (let x = 0; x < PW; x++) { const i = (PY + y) * w + PX + x, j = (y * PW + x) * 4; if (band[i] && wt[i] > 0) { for (let k = 0; k < 3; k++) data[j + k] = acc[i * 3 + k] / wt[i]; } else for (let k = 0; k < 3; k++) data[j + k] = img[i * 4 + k]; data[j + 3] = 255; }
+  return { x: PX / w, y: PY / h, w: PW / w, h: PH / h, pw: PW, ph: PH, data, lin };
 }
 
 // 生成式補圖：依遮罩範圍裁出正方形區域（含周圍內容），縮到 512 交給 MI-GAN，再放回原尺寸
@@ -1843,6 +1904,7 @@ async function renderPhotoOffscreen(p, fn, half, opts) {
     const s = Math.min(1, 1536 / Math.max(src.width, src.height)); const w = Math.round(src.width * s), h = Math.round(src.height * s);
     const img = eng.renderPixels({ ...DEFAULT_EDITS(), temp: edits.temp, tint: edits.tint, exposure: edits.exposure, sharpen: 0, colorNoise: 0 }, w, h);
     const m = await buildMasks(img); eng.setMasks(applyMaskFix(m, edits.maskFix)); eng.setPins(pinsFor(m.pins, edits));
+    if (edits.slim || edits.waist || edits.bodySlim || edits.eyeEnlarge) { const pk = p.id + '|' + JSON.stringify(edits.maskFix || null); let pl = plateCache.get(pk); if (!pl) { try { pl = await buildPlate(src, applyMaskFix(m, edits.maskFix)); } catch (err) { console.warn('plate', err); } } if (pl) eng.setPlate(pl); }
     if (edits.enhance && !edits.enhanceVec) edits.enhanceVec = enhanceVector(eng, edits, m);
   } else if (edits.enhance && !edits.enhanceVec) edits.enhanceVec = enhanceVector(eng, edits, null);
   if (edits.lutPath && edits.lutAmt > 0 && eng.lutKey !== edits.lutPath) await eng.loadLUT(edits.lutPath);
@@ -2499,13 +2561,15 @@ function bindGlobal() {
   window.addEventListener('resize', () => { if (S.view === 'edit') { layoutCanvas(); draw(); } });
 
   // 鍵盤
-  document.addEventListener('keyup', (e) => { if (e.key === 'Alt') { E.altErase = false; updBrushCursor(); } if (e.key === ' ') E.spaceDown = false; });
+  window.addEventListener('blur', () => { if (E.altPeek) { E.altPeek = false; draw(); } });
+  document.addEventListener('keyup', (e) => { if (e.key === 'Alt') { e.preventDefault(); if (E.altPeek) { E.altPeek = false; draw(); } } if (e.key === 'Control' || e.key === 'Meta') { E.altErase = false; updBrushCursor(); } if (e.key === ' ') E.spaceDown = false; });
   document.addEventListener('keydown', (e) => {
     if (e.target.matches('input[type=text],input[type=number],select') || !$('#modal').classList.contains('hidden')) return;
     const k = e.key, ctrl = e.ctrlKey || e.metaKey;
+    if (k === 'Alt' && S.view === 'edit' && !(E.healMode && E.healTool === 'clone')) { e.preventDefault(); if (!E.altPeek) { E.altPeek = true; draw(); } return; }
     if (S.view === 'edit' && E.brushMode) {
       if (k === '[' || k === ']') { E.brush.size = Math.max(0.002, Math.min(0.3, E.brush.size * (k === ']' ? 1.15 : 0.87))); const b = $('#brSize'); if (b) { b.value = Math.round(E.brush.size * 1000); $('#brSizeV').textContent = b.value; } updBrushCursor(); return; }
-      if (k === 'Alt') { E.altErase = true; updBrushCursor(); e.preventDefault(); return; }
+      if (k === 'Control' || k === 'Meta') { E.altErase = true; updBrushCursor(); return; }
       if (k === ' ') { E.spaceDown = true; e.preventDefault(); return; }
       if (k === 'Escape') { setBrushMode(false); renderTools(); return; }
     }
@@ -2550,5 +2614,5 @@ function pasteSettings(ids) {
 }
 
 window.addEventListener('beforeunload', () => { if (E.photo) persistEdits(); });
-window.__capy = { films: FILMS, filmPatch, optDialog: (ids) => aiOptimizeDialog(ids), S, E, eng: () => engine, refreshHeal: () => { E.healKey = ""; refreshHeal(); }, setEdit, renderTools, openEdit, computeGroups, exportRun: (ids, o) => runExport(ids, o) };
+window.__capy = { buildPlate: (m) => buildPlate(decodeCache.get(E.photo.id).src, m || applyMaskFix(E.masks, E.edits.maskFix)), films: FILMS, filmPatch, optDialog: (ids) => aiOptimizeDialog(ids), S, E, eng: () => engine, refreshHeal: () => { E.healKey = ""; refreshHeal(); }, setEdit, renderTools, openEdit, computeGroups, exportRun: (ids, o) => runExport(ids, o) };
 boot();

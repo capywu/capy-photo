@@ -1,5 +1,5 @@
 Unicode true
-!define VER "1.5.0"
+!define VER "1.6.0"
 !define SRC "..\dist\win-unpacked"
 Name "Capy Photo ${VER}"
 OutFile "..\dist\CapyPhoto-${VER}-Portable.exe"
@@ -7,7 +7,7 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Icon "..\build\icon.ico"
 SilentInstall silent
-VIProductVersion "1.5.0.0"
+VIProductVersion "1.6.0.0"
 VIAddVersionKey "ProductName" "Capy Photo（免安裝版）"
 VIAddVersionKey "FileDescription" "Capy Photo 免安裝版"
 VIAddVersionKey "FileVersion" "${VER}"

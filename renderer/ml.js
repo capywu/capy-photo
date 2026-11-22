@@ -47,28 +47,36 @@ export async function estimateDepth(imgData, W, H) {
 
 // ── 臉部解析（BiSeNet，CelebAMask 19 類）：回傳整張圖的頭髮機率 ──
 // box: 臉的範圍 [x0,y0,x1,y1]（像素），會放大 2.6 倍並往下移，涵蓋長髮
-export async function parseHair(imgData, W, H, box, out) {
+// 臉部解析（BiSeNet，19 類）：用三種裁切（臉部特寫／頭部／往下延伸到胸口）各跑一次，
+// 特寫抓瀏海與臉部輪廓細節、大範圍抓長髮髮尾，取各裁切的最大機率。回傳頭髮、臉部、臉部皮膚機率（W×H）
+const FACE_CLS = [1, 2, 3, 4, 5, 6, 10, 11, 12, 13], SKIN_CLS = [1, 10];
+export async function parseHair(imgData, W, H, box, out, outFace, outSkin) {
   const s = await session('face-parsing.onnx');
-  const fw = box[2] - box[0], fh = box[3] - box[1]; const sz = Math.max(fw, fh) * 2.6;
-  const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2 + sz * 0.12; const X0 = cx - sz / 2, Y0 = cy - sz / 2;
-  const N = 512; const c = new OffscreenCanvas(W, H); c.getContext('2d').putImageData(imgData, 0, 0);
-  const r = new OffscreenCanvas(N, N); const rx = r.getContext('2d', { willReadFrequently: true }); rx.fillStyle = '#000'; rx.fillRect(0, 0, N, N); rx.imageSmoothingQuality = 'high';
-  rx.drawImage(c, X0, Y0, sz, sz, 0, 0, N, N);
-  const d = rx.getImageData(0, 0, N, N).data; const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
-  const t = new Float32Array(3 * N * N);
-  for (let i = 0; i < N * N; i++) for (let k = 0; k < 3; k++) t[k * N * N + i] = (d[i * 4 + k] / 255 - mean[k]) / std[k];
-  const res = await s.run({ input: new ort.Tensor('float32', t, [1, 3, N, N]) });
-  const o = res.output.data; const C = res.output.dims[1], oh = res.output.dims[2], ow = res.output.dims[3];
-  // softmax 取頭髮（17）機率
-  const ph = new Float32Array(ow * oh);
-  for (let i = 0; i < ow * oh; i++) { let mx = -1e9; for (let k = 0; k < C; k++) mx = Math.max(mx, o[k * ow * oh + i]); let sum = 0; for (let k = 0; k < C; k++) sum += Math.exp(o[k * ow * oh + i] - mx); ph[i] = Math.exp(o[17 * ow * oh + i] - mx) / sum; }
-  const x0 = Math.max(0, Math.floor(X0)), y0 = Math.max(0, Math.floor(Y0)), x1 = Math.min(W, Math.ceil(X0 + sz)), y1 = Math.min(H, Math.ceil(Y0 + sz));
-  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-    const fx = (x + 0.5 - X0) / sz * ow - 0.5, fy = (y + 0.5 - Y0) / sz * oh - 0.5;
-    const a = Math.max(0, Math.min(ow - 1, Math.floor(fx))), b = Math.max(0, Math.min(oh - 1, Math.floor(fy))), a1 = Math.min(ow - 1, a + 1), b1 = Math.min(oh - 1, b + 1);
-    const ax = Math.min(1, Math.max(0, fx - a)), ay = Math.min(1, Math.max(0, fy - b));
-    const v = (ph[b * ow + a] * (1 - ax) + ph[b * ow + a1] * ax) * (1 - ay) + (ph[b1 * ow + a] * (1 - ax) + ph[b1 * ow + a1] * ax) * ay;
-    const i = y * W + x; if (v > out[i]) out[i] = v;
+  const fw = box[2] - box[0], fh = box[3] - box[1], F = Math.max(fw, fh); const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
+  const c = new OffscreenCanvas(W, H); c.getContext('2d').putImageData(imgData, 0, 0);
+  const N = 512; const r = new OffscreenCanvas(N, N); const rx = r.getContext('2d', { willReadFrequently: true }); rx.imageSmoothingQuality = 'high';
+  const crops = [[F * 1.7, cx, cy + F * 0.02, true], [F * 2.6, cx, cy + F * 0.3, true], [F * 4.4, cx, cy + F * 1.35, false]];
+  for (const [sz, ccx, ccy, faceToo] of crops) {
+    const X0 = ccx - sz / 2, Y0 = ccy - sz / 2;
+    rx.fillStyle = '#000'; rx.fillRect(0, 0, N, N); rx.drawImage(c, X0, Y0, sz, sz, 0, 0, N, N);
+    const d = rx.getImageData(0, 0, N, N).data; const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+    const t = new Float32Array(3 * N * N); for (let i = 0; i < N * N; i++) for (let k = 0; k < 3; k++) t[k * N * N + i] = (d[i * 4 + k] / 255 - mean[k]) / std[k];
+    const res = await s.run({ input: new ort.Tensor('float32', t, [1, 3, N, N]) });
+    const o = res.output.data; const C = res.output.dims[1], oh = res.output.dims[2], ow = res.output.dims[3]; const P = ow * oh;
+    const ph = new Float32Array(P), pf = new Float32Array(P), ps = new Float32Array(P);
+    for (let i = 0; i < P; i++) { let mx = -1e9; for (let k = 0; k < C; k++) mx = Math.max(mx, o[k * P + i]); let sum = 0; for (let k = 0; k < C; k++) sum += Math.exp(o[k * P + i] - mx);
+      ph[i] = Math.exp(o[17 * P + i] - mx) / sum; let f = 0; for (const k of FACE_CLS) f += Math.exp(o[k * P + i] - mx); pf[i] = f / sum; let sk = 0; for (const k of SKIN_CLS) sk += Math.exp(o[k * P + i] - mx); ps[i] = sk / sum; }
+    // 裁切邊緣附近的結果比較不可靠，往外淡出
+    const x0 = Math.max(0, Math.floor(X0)), y0 = Math.max(0, Math.floor(Y0)), x1 = Math.min(W, Math.ceil(X0 + sz)), y1 = Math.min(H, Math.ceil(Y0 + sz));
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+      const u = (x + 0.5 - X0) / sz, v = (y + 0.5 - Y0) / sz; const fx = u * ow - 0.5, fy = v * oh - 0.5;
+      const a = Math.max(0, Math.min(ow - 1, Math.floor(fx))), b = Math.max(0, Math.min(oh - 1, Math.floor(fy))), a1 = Math.min(ow - 1, a + 1), b1 = Math.min(oh - 1, b + 1);
+      const ax = Math.min(1, Math.max(0, fx - a)), ay = Math.min(1, Math.max(0, fy - b));
+      const bil = (q) => (q[b * ow + a] * (1 - ax) + q[b * ow + a1] * ax) * (1 - ay) + (q[b1 * ow + a] * (1 - ax) + q[b1 * ow + a1] * ax) * ay;
+      const edge = Math.min(1, Math.min(u, v, 1 - u, 1 - v) / 0.04); const i = y * W + x;
+      const hv = bil(ph) * edge; if (hv > out[i]) out[i] = hv;
+      if (faceToo && outFace) { const fv = bil(pf) * edge; if (fv > outFace[i]) outFace[i] = fv; const sv = bil(ps) * edge; if (outSkin && sv > outSkin[i]) outSkin[i] = sv; }
+    }
   }
   return out;
 }
