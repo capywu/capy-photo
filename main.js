@@ -8,6 +8,7 @@ const rawmeta = require('./lib/rawmeta');
 app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=8192');
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-unsafe-webgpu');
 app.commandLine.appendSwitch('enable-unsafe-swiftshader');
 
 protocol.registerSchemesAsPrivileged([

@@ -1,5 +1,6 @@
 // AI：人臉偵測、臉部網格、閉眼判斷、人像分割，以及修圖遮罩與液化控制點
 import { Human } from '../node_modules/@vladmandic/human/dist/human.esm.js';
+import { estimateDepth } from './ml.js';
 
 let human = null, loading = null;
 export async function initAI() {
@@ -57,8 +58,28 @@ export function smileScore(m) {
 
 async function detectFaces(input) {
   const h = await initAI();
-  const r = await h.detect(input);
-  return (r.face || []).filter(f => f.mesh && f.mesh.length >= 468 && f.score > 0.4);
+  const run = async (inp) => {
+    // 注意：Human 會把 detect() 傳入的設定永久合併，所以每次都明確指定（避免被身形偵測關掉人臉偵測）
+    const r = await h.detect(inp, { face: { enabled: true }, body: { enabled: false }, segmentation: { enabled: false } });
+    return (r.face || []).filter(f => f.mesh && f.mesh.length >= 468 && f.score > 0.4);
+  };
+  let faces = await run(input);
+  // 找不到時：把畫面切成重疊的區塊放大再找（遠處、小臉、團體照）
+  if (!faces.length && Math.max(input.width, input.height) >= 600) {
+    const W = input.width, H = input.height; const cw = Math.round(W * 0.6), ch = Math.round(H * 0.6);
+    const found = [];
+    for (const [ox, oy] of [[0, 0], [W - cw, 0], [0, H - ch], [W - cw, H - ch], [(W - cw) / 2, (H - ch) / 2]]) {
+      const c = new OffscreenCanvas(cw, ch); c.getContext('2d').drawImage(input, Math.round(ox), Math.round(oy), cw, ch, 0, 0, cw, ch);
+      for (const f of await run(c)) {
+        const sh = (p) => [p[0] + ox, p[1] + oy, p[2]];
+        const g = { ...f, box: [f.box[0] + ox, f.box[1] + oy, f.box[2], f.box[3]], mesh: f.mesh.map(sh) };
+        const dup = found.some(q => Math.abs(q.box[0] - g.box[0]) < g.box[2] * 0.5 && Math.abs(q.box[1] - g.box[1]) < g.box[3] * 0.5);
+        if (!dup) found.push(g);
+      }
+    }
+    faces = found;
+  }
+  return faces;
 }
 
 // 挑片分析（在預覽圖上）：人臉數、閉眼、臉部清晰度
@@ -251,6 +272,7 @@ export async function buildMasks(imgData) {
   try {
     if (person) {
       const rb = await h.detect(c, { body: { enabled: true, modelPath: 'movenet-lightning.json', maxDetected: 1, minConfidence: 0.2 }, face: { enabled: false } });
+        h.config.face.enabled = true; h.config.body.enabled = false;
       const b = (rb.body || [])[0];
       if (b && b.score > 0.25) {
         const kp = (n) => { const k = b.keypoints.find(q => q.part === n); return k && k.score > 0.2 ? k.position : null; };
@@ -309,12 +331,15 @@ export async function buildMasks(imgData) {
   }
   let skinRef = null;
   if (skinSamples.length) { const r = skinSamples.reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], [0, 0, 0]).map(v => Math.pow(v / skinSamples.length / 255, 2.2)); skinRef = r; }
+  // 深度（Depth Anything V2）：1＝近、0＝遠
+  let depth = null;
+  try { depth = await estimateDepth(imgData, W, H); for (let i = 0; i < W * H; i++) m4[i * 4 + 2] = Math.round(depth[i] * 255); } catch (err) { console.warn('depth', err); }
   const faceFrac = faces.length ? Math.max(...faces.map(f => dist(f.mesh[234], f.mesh[454]))) / Math.max(W, H) : 0.25;
   let skyBottom = 0, skyN = 0; for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 4) if (sky[y * W + x] > 128) { skyN++; skyBottom = Math.max(skyBottom, y / H); }
   // 構圖用：主體範圍
   let bb = null; if (person) { let x0 = W, y0 = H, x1 = 0, y1 = 0; for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) if (person[(y * W + x) * 4 + 3] > 128) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); } if (x1 > x0) bb = [x0 / W, y0 / H, x1 / W, y1 / H]; }
   const faceBoxes = faces.map(f => [f.box[0] / W, f.box[1] / H, (f.box[0] + f.box[2]) / W, (f.box[1] + f.box[3]) / H]);
-  return { w: W, h: H, m1, m2, m3, m4, hasHair: hair.some(v => v > 0.5), hasWater: water.some(v => v > 128), hasBody: pins.some(p => p.kind === 'waist'), pins, faces: faces.length, hasPerson: !!person, skinRef, faceFrac, skyBottom: skyN > 50 ? skyBottom : 0, hasSky: skyN > 50, subject: bb, faceBoxes };
+  return { w: W, h: H, m1, m2, m3, m4, depth, hasDepth: !!depth, hasHair: hair.some(v => v > 0.5), hasWater: water.some(v => v > 128), hasBody: pins.some(p => p.kind === 'waist'), pins, faces: faces.length, hasPerson: !!person, skinRef, faceFrac, skyBottom: skyN > 50 ? skyBottom : 0, hasSky: skyN > 50, subject: bb, faceBoxes };
 }
 
 function expand(m, idx, k) {

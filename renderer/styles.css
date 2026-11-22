@@ -115,3 +115,12 @@ input[type=range]{accent-color:#e0874a}
 .modal .row input[type=text]{flex:1}
 .modal .acts{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 .toast{position:fixed;bottom:44px;left:50%;transform:translateX(-50%);background:#2c2e33;border:1px solid #444;padding:8px 16px;border-radius:20px;z-index:60;font-size:12.5px;color:#eee}
+
+.menu .msub{position:relative;display:flex;justify-content:space-between;align-items:center;gap:14px}.menu .msub .arr{color:#888;font-size:10px}
+.menu .msub>.subm{display:none;position:absolute;left:100%;top:-6px;min-width:190px}.menu .subm.leaf{max-height:calc(100vh - 12px);overflow-y:auto;min-width:210px}
+.menu .msub:hover>.subm{display:block}.menu .msub:hover{background:#3a2a1e;color:#f3b07a}
+.menu .subm div{color:#ddd}.menu .mh{cursor:default;color:#9a8 !important;font-size:11px;padding:6px 10px 2px}.menu .mh:hover{background:none}
+
+.sec .t .tx{display:flex;gap:10px;align-items:center}
+.rst{cursor:pointer;color:#9aa0a8;font-size:11px;padding:1px 7px;border:1px solid #3a3d44;border-radius:10px;margin-left:8px;white-space:nowrap}.rst:hover{color:#f3b07a;border-color:#e0874a}
+.sl .rsk{cursor:pointer;color:#e0874a;font-size:12px;width:14px;text-align:center;flex:none}.sl .rsk.off{visibility:hidden}.sl .rsk:hover{color:#ffc79a}

@@ -3,6 +3,8 @@ import { Engine, DEFAULT_EDITS, isDefault, isFullCrop, effective } from './engin
 import { decodeRaw, decodeImage, cameraLook, fileURL } from './raw.js';
 import { initAI, analyzeForCulling, buildMasks, pinsFor } from './ai.js';
 import { applyHeals, detectLines, encodeRLE } from './heal.js';
+import { deblurAI, backend as mlBackend } from './ml.js';
+import { optimize, SCENE_NAMES } from './optimize.js';
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -10,8 +12,52 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 const COLORS = { red: '#d9534f', yellow: '#e8b04a', green: '#5cb85c', blue: '#4a8fe0', purple: '#9b6ce0' };
-const AI_KEYS = ['smooth', 'blemish', 'skinEven', 'darkCircle', 'teeth', 'eyeBright', 'eyeEnlarge', 'slim', 'subjectLight', 'bgBlur', 'sky', 'enhance', 'matte', 'skinHue', 'skinSat', 'skinLum', 'faceLight', 'contour', 'lips', 'brows', 'blush', 'bgLight', 'bgSat', 'bgClean', 'skyRep', 'fog', 'dust', 'structure', 'hairAmt', 'hairLum', 'waist', 'bodySlim', 'water', 'waterColor', 'twilight', 'bgRep'];
+const AI_KEYS = ['smooth', 'blemish', 'skinEven', 'darkCircle', 'teeth', 'eyeBright', 'eyeEnlarge', 'slim', 'subjectLight', 'bgBlur', 'sky', 'enhance', 'matte', 'skinHue', 'skinSat', 'skinLum', 'faceLight', 'contour', 'lips', 'brows', 'blush', 'bgLight', 'bgSat', 'bgClean', 'skyRep', 'fog', 'dust', 'structure', 'hairAmt', 'hairLum', 'waist', 'bodySlim', 'water', 'waterColor', 'twilight', 'bgRep', 'focusAmt'];
 const needsAI = (e) => AI_KEYS.some(k => e[k]) || (e.local || []).length > 0;
+// 富士底片模擬（依官方描述與常見特性調配，只改「色彩風格」，不動曝光、白平衡與人像修飾）
+const FILM_LOOK_KEYS = ['contrast', 'highlights', 'shadows', 'whites', 'blacks', 'vibrance', 'saturation', 'clarity', 'hslH', 'hslS', 'hslL', 'curve', 'grain', 'bw', 'bwFilter', 'bwToneH', 'bwToneS', 'gradeSH', 'gradeSS', 'gradeHH', 'gradeHS', 'gradeBal', 'chrome', 'chromeBlue', 'bleach', 'dehaze', 'halation'];
+const FILMS = [
+  { cat: '經典特色與電影感' },
+  { id: 'f_cc', name: 'Classic Chrome 經典正片', sw: 'linear-gradient(135deg,#9aa49a,#3d4a52)', e: { saturation: -28, contrast: 14, highlights: -12, blacks: -14, curve: [[0, 0], [0.25, 0.2], [0.75, 0.77], [1, 0.97]], hslH: [-6, -4, 6, 10, 0, -12, 0, 0], hslS: [-22, -10, -18, -22, -10, -12, -15, -20], gradeSH: 195, gradeSS: 10, gradeHH: 45, gradeHS: 6, chrome: 35 } },
+  { id: 'f_cn', name: 'Classic Neg. 經典負片', sw: 'linear-gradient(135deg,#e8c9a0,#2f5a5a)', e: { saturation: -8, contrast: 26, highlights: -8, blacks: -10, curve: [[0, 0.02], [0.25, 0.19], [0.75, 0.8], [1, 0.97]], hslH: [-8, 0, -6, 14, 6, 0, 0, -6], hslS: [-10, -6, -14, -12, 0, -8, -10, -10], gradeSH: 172, gradeSS: 26, gradeHH: 38, gradeHS: 18, gradeBal: -10, grain: 12 } },
+  { id: 'f_nn', name: 'Nostalgic Neg. 懷舊負片', sw: 'linear-gradient(135deg,#f2c27a,#5a4636)', e: { saturation: 6, contrast: 4, highlights: -22, shadows: 12, curve: [[0, 0.02], [0.3, 0.29], [0.75, 0.76], [1, 0.96]], hslS: [8, 10, 6, -6, -8, -10, 0, 0], gradeSH: 25, gradeSS: 8, gradeHH: 40, gradeHS: 32, gradeBal: 10, grain: 8 } },
+  { id: 'f_et', name: 'ETERNA 電影', sw: 'linear-gradient(135deg,#c5ccc4,#4f6068)', e: { saturation: -32, contrast: -30, highlights: -30, shadows: 22, curve: [[0, 0.06], [0.5, 0.5], [1, 0.95]], hslH: [0, 0, 0, 10, 0, -6, 0, 0], gradeSH: 188, gradeSS: 14, gradeHH: 35, gradeHS: 6 } },
+  { id: 'f_eb', name: 'ETERNA 電影漂白', sw: 'linear-gradient(135deg,#d8d8d2,#262a2e)', e: { bleach: 70, saturation: -45, contrast: 32, clarity: 14, highlights: -10, blacks: -12, gradeSH: 205, gradeSS: 10, gradeHH: 40, gradeHS: 4 } },
+  { cat: '日常通用與風景高飽和' },
+  { id: 'f_pv', name: 'PROVIA 標準', sw: 'linear-gradient(135deg,#7fb3e0,#3d7a3d)', e: { contrast: 6, vibrance: 6, curve: [[0, 0], [0.25, 0.24], [0.75, 0.77], [1, 1]] } },
+  { id: 'f_vv', name: 'Velvia 鮮豔', sw: 'linear-gradient(135deg,#ff7a3d,#1f6fd1)', e: { saturation: 32, vibrance: 18, contrast: 24, blacks: -12, curve: [[0, 0], [0.25, 0.21], [0.75, 0.8], [1, 1]], hslS: [14, 10, 6, 18, 10, 20, 10, 10], hslL: [-4, 0, 0, -6, 0, -8, 0, 0], chrome: 40, chromeBlue: 35 } },
+  { id: 'f_as', name: 'ASTIA 柔和', sw: 'linear-gradient(135deg,#f5c6b8,#6f9fc9)', e: { saturation: 14, contrast: -12, highlights: -16, shadows: 8, hslS: [6, -6, 4, 10, 6, 10, 0, 6], hslL: [0, 8, 0, 0, 0, 0, 0, 0], curve: [[0, 0.02], [0.5, 0.51], [1, 0.98]] } },
+  { id: 'f_ra', name: 'REALA ACE', sw: 'linear-gradient(135deg,#d6dde6,#38505c)', e: { contrast: 16, vibrance: 6, saturation: 2, blacks: -8, curve: [[0, 0], [0.25, 0.22], [0.75, 0.78], [1, 0.99]], hslS: [0, -4, 0, 0, 0, 0, 0, 0] } },
+  { cat: '人像專用負片' },
+  { id: 'f_ph', name: 'PRO Neg. Hi', sw: 'linear-gradient(135deg,#f0d2c2,#5b6670)', e: { saturation: -8, contrast: 8, shadows: -6, blacks: -6, hslS: [-6, -12, -8, -10, 0, -6, 0, 0], hslL: [0, 6, 0, 0, 0, 0, 0, 0] } },
+  { id: 'f_ps', name: 'PRO Neg. Std', sw: 'linear-gradient(135deg,#f3dccf,#8c959c)', e: { saturation: -14, contrast: -22, highlights: -12, shadows: 12, hslS: [-8, -14, -10, -12, 0, -8, 0, 0], hslL: [0, 8, 0, 0, 0, 0, 0, 0], curve: [[0, 0.03], [0.5, 0.51], [1, 0.97]] } },
+  { cat: '黑白與單色懷舊' },
+  { id: 'f_ac', name: 'ACROS', sw: 'linear-gradient(135deg,#eee,#111)', e: { bw: true, contrast: 16, blacks: -14, clarity: 10, grain: 22, curve: [[0, 0], [0.25, 0.2], [0.6, 0.62], [1, 1]] } },
+  { id: 'f_acy', name: 'ACROS + 黃濾鏡', sw: 'linear-gradient(135deg,#f3f0d8,#111)', e: { bw: true, bwFilter: 'ye', contrast: 20, blacks: -14, clarity: 10, grain: 22, curve: [[0, 0], [0.25, 0.2], [0.6, 0.62], [1, 1]] } },
+  { id: 'f_acr', name: 'ACROS + 紅濾鏡', sw: 'linear-gradient(135deg,#f2d6d6,#000)', e: { bw: true, bwFilter: 'r', contrast: 28, blacks: -18, clarity: 12, grain: 22, curve: [[0, 0], [0.25, 0.18], [0.6, 0.63], [1, 1]] } },
+  { id: 'f_acg', name: 'ACROS + 綠濾鏡', sw: 'linear-gradient(135deg,#d9eedb,#111)', e: { bw: true, bwFilter: 'g', contrast: 12, blacks: -10, clarity: 6, grain: 22 } },
+  { id: 'f_mo', name: '黑白 Monochrome', sw: 'linear-gradient(135deg,#ddd,#333)', e: { bw: true, contrast: 6 } },
+  { id: 'f_moy', name: '黑白 + 黃濾鏡', sw: 'linear-gradient(135deg,#e9e6cf,#333)', e: { bw: true, bwFilter: 'ye', contrast: 10 } },
+  { id: 'f_mor', name: '黑白 + 紅濾鏡', sw: 'linear-gradient(135deg,#e6caca,#222)', e: { bw: true, bwFilter: 'r', contrast: 20 } },
+  { id: 'f_mog', name: '黑白 + 綠濾鏡', sw: 'linear-gradient(135deg,#d2e6d4,#333)', e: { bw: true, bwFilter: 'g', contrast: 4 } },
+  { id: 'f_se', name: '復古棕 Sepia', sw: 'linear-gradient(135deg,#e8cfa4,#4a3520)', e: { bw: true, bwToneH: 32, bwToneS: 70, contrast: 4 } },
+  { brand: 'kodak' },
+  { cat: '柯達｜經典暖黃陽光' },
+  { id: 'k_gd', name: 'Kodak Gold 200', sw: 'linear-gradient(135deg,#ffd166,#c2552d)', e: { saturation: 12, vibrance: 8, contrast: 10, highlights: -8, shadows: 6, hslH: [4, 6, -8, 8, 0, 0, 0, 0], hslS: [14, 12, 22, -10, -4, -6, 0, 0], hslL: [0, 4, 6, -6, 0, -4, 0, 0], gradeSH: 35, gradeSS: 10, gradeHH: 45, gradeHS: 26, gradeBal: 6, curve: [[0, 0.03], [0.25, 0.23], [0.75, 0.78], [1, 0.98]], grain: 14 } },
+  { id: 'k_cp', name: 'Kodak ColorPlus 200', sw: 'linear-gradient(135deg,#f0a35e,#5a3d2a)', e: { saturation: 4, contrast: 18, highlights: -12, blacks: -6, hslH: [6, 4, -10, 10, 0, -4, 0, 0], hslS: [10, 14, 10, -16, -10, -12, 0, 0], gradeSH: 28, gradeSS: 14, gradeHH: 36, gradeHS: 30, gradeBal: 0, curve: [[0, 0.05], [0.25, 0.22], [0.75, 0.79], [1, 0.95]], grain: 26 } },
+  { id: 'k_um', name: 'Kodak Ultramax 400', sw: 'linear-gradient(135deg,#e63946,#1d6fd1)', e: { saturation: 18, vibrance: 10, contrast: 20, blacks: -8, hslS: [18, 10, 10, 0, 6, 18, 6, 6], hslL: [-4, 0, 4, 0, 0, -6, 0, 0], gradeSH: 200, gradeSS: 6, gradeHH: 42, gradeHS: 16, curve: [[0, 0.02], [0.25, 0.21], [0.75, 0.79], [1, 0.99]], grain: 20 } },
+  { cat: '柯達｜奶油人像粉彩' },
+  { id: 'k_p4', name: 'Kodak Portra 400', sw: 'linear-gradient(135deg,#f6d5c3,#8fa7a0)', e: { saturation: -6, vibrance: 6, contrast: -12, highlights: -14, shadows: 10, hslH: [2, -2, -6, 6, 0, -6, 0, 0], hslS: [-6, -4, -6, -18, -8, -12, -10, -6], hslL: [4, 8, 4, 0, 0, 0, 0, 0], gradeSH: 185, gradeSS: 8, gradeHH: 30, gradeHS: 14, curve: [[0, 0.04], [0.25, 0.27], [0.75, 0.77], [1, 0.97]], grain: 8 } },
+  { id: 'k_p16', name: 'Kodak Portra 160', sw: 'linear-gradient(135deg,#f3e0d6,#a9b7b2)', e: { saturation: -14, contrast: -18, highlights: -12, shadows: 12, hslS: [-10, -8, -10, -22, -10, -14, -12, -10], hslL: [4, 10, 4, 0, 0, 2, 0, 0], gradeSH: 190, gradeSS: 6, gradeHH: 28, gradeHS: 8, curve: [[0, 0.04], [0.25, 0.28], [0.75, 0.77], [1, 0.97]], grain: 4 } },
+  { id: 'k_p8', name: 'Kodak Portra 800', sw: 'linear-gradient(135deg,#f2b880,#2f3e46)', e: { saturation: 6, vibrance: 8, contrast: 6, highlights: -12, shadows: 6, hslS: [8, 6, 4, -12, -4, -6, 0, 0], hslL: [0, 6, 0, 0, 0, 0, 0, 0], gradeSH: 195, gradeSS: 12, gradeHH: 38, gradeHS: 24, gradeBal: 8, curve: [[0, 0.04], [0.25, 0.24], [0.75, 0.77], [1, 0.97]], grain: 18 } },
+  { cat: '柯達｜正片、高飽和與電影' },
+  { id: 'k_e1', name: 'Kodak Ektachrome E100', sw: 'linear-gradient(135deg,#e8f1ff,#1c4fa0)', e: { saturation: 10, vibrance: 12, contrast: 20, blacks: -10, clarity: 8, hslS: [0, -6, 0, 4, 10, 20, 8, 0], hslL: [0, 2, 0, 0, 0, -6, 0, 0], gradeSH: 215, gradeSS: 12, gradeHH: 210, gradeHS: 6, chromeBlue: 25, curve: [[0, 0], [0.25, 0.21], [0.75, 0.8], [1, 1]] } },
+  { id: 'k_ek', name: 'Kodak Ektar 100', sw: 'linear-gradient(135deg,#ff3d2e,#0b3d91)', e: { saturation: 30, vibrance: 14, contrast: 24, blacks: -12, clarity: 10, hslH: [-4, -6, 0, 6, 0, 4, 0, 0], hslS: [24, 20, 6, 10, 10, 24, 10, 10], hslL: [-6, -2, 0, -4, 0, -10, 0, 0], gradeHH: 38, gradeHS: 10, chrome: 35, chromeBlue: 25, curve: [[0, 0], [0.25, 0.2], [0.75, 0.8], [1, 1]] } },
+  { id: 'k_5t', name: 'Kodak Vision3 500T', sw: 'linear-gradient(135deg,#ff6b4a,#0f3a52)', e: { saturation: -8, contrast: -6, highlights: -18, shadows: 10, hslH: [0, -4, 0, 0, 0, -10, 0, 0], hslS: [10, 6, -10, -20, 6, 10, 0, 0], gradeSH: 192, gradeSS: 32, gradeHH: 205, gradeHS: 10, gradeBal: -6, halation: 45, curve: [[0, 0.05], [0.25, 0.25], [0.75, 0.75], [1, 0.96]], grain: 16 } },
+  { id: 'k_25d', name: 'Kodak Vision3 250D', sw: 'linear-gradient(135deg,#f1c27d,#355c7d)', e: { saturation: -6, contrast: -10, highlights: -20, shadows: 14, hslS: [4, 4, 0, -14, -4, 4, 0, 0], gradeSH: 205, gradeSS: 14, gradeHH: 40, gradeHS: 14, curve: [[0, 0.05], [0.25, 0.26], [0.75, 0.76], [1, 0.97]], grain: 10 } },
+  { cat: '柯達｜經典黑白' },
+  { id: 'k_tx', name: 'Kodak Tri-X 400', sw: 'linear-gradient(135deg,#f5f5f5,#000)', e: { bw: true, bwFilter: 'ye', contrast: 32, blacks: -22, whites: 6, clarity: 18, grain: 40, curve: [[0, 0], [0.25, 0.17], [0.75, 0.82], [1, 1]] } }
+];
 const BUILTIN_PRESETS = [
   { id: 'b1', name: '婚禮｜暖調柔光', sw: 'linear-gradient(135deg,#f3c79a,#b8735a)', e: { temp: 12, tint: 3, exposure: 0.15, contrast: 8, highlights: -35, shadows: 25, vibrance: 15, saturation: -5, clarity: 5, curve: [[0, 0.04], [0.25, 0.25], [0.75, 0.78], [1, 0.98]] } },
   { id: 'b2', name: '人像｜清透膚色', sw: 'linear-gradient(135deg,#ffe0cc,#d79a86)', e: { exposure: 0.25, highlights: -25, shadows: 20, vibrance: 10, hslL: [0, 12, 0, 0, 0, 0, 0, 0], hslS: [0, -10, 0, 0, 0, 0, 0, 0], smooth: 35, blemish: 50, darkCircle: 25, eyeBright: 20 } },
@@ -115,10 +161,12 @@ function renderLibSide() {
   ${smart('best', '⭐ AI 推薦（每組最佳）', count(p => p.ai?.best))}
   ${smart('closed', '閉眼照片', count(p => p.ai?.closed > 0))}
   ${smart('blur', '失焦 / 模糊', count(p => p.ai?.blur))}
+  ${f.smart === 'blur' ? '<div class="item" id="fixBlur"><span class="nm" style="color:#e0874a">✦ 一鍵救回這些模糊照片</span></div>' : ''}
   ${smart('similar', '相似照片群組', groups + ' 組')}
   ${smart('faces', '有人臉的照片', count(p => p.ai?.faces > 0))}
   ${smart('smile', '笑容', count(p => p.ai?.smiles > 0))}
   <div class="item" id="aiPickAll"><span class="nm" style="color:#e0874a">✦ 一鍵 AI 挑片</span></div>
+  <div class="item" id="reAnalyze"><span class="nm" style="color:#9aa">↻ 重新 AI 分析全部照片</span></div>
   <div class="item" id="aiRateAll"><span class="nm" style="color:#e0874a">✦ AI 自動評星</span></div>
   <h4>篩選</h4>
   <div class="chips">
@@ -224,7 +272,7 @@ function renderInfo() {
   <div class="kv"><span>清晰度</span><span>${p.ai.blur ? '偏模糊' : '清晰'}（${Math.round(p.ai.score || 0)} 分）</span></div>
   <div class="kv"><span>相似群組</span><span>${p.ai.group ? `第 ${p.ai.group} 組，共 ${p.ai.groupSize} 張${p.ai.best ? '（本組最佳）' : ''}` : '無'}</span></div>` : '<div class="hint">分析中…</div>'}
   <h4>快速修圖</h4>
-  <div class="chips"><span class="chip" data-quick="edit">進入編輯 (E)</span><span class="chip" data-quick="auto">自動調整</span><span class="chip" data-quick="beauty">一鍵人像美化</span><span class="chip" data-quick="preset">套用預設…</span><span class="chip" data-quick="copy">複製設定</span><span class="chip ${S.clipboard ? '' : 'dis'}" data-quick="paste">貼上設定</span><span class="chip" data-quick="reset">重設修圖</span></div>
+  <div class="chips"><span class="chip" data-quick="edit">進入編輯 (E)</span><span class="chip" data-quick="optimize">✦ AI 最佳化修圖</span><span class="chip" data-quick="beauty">一鍵人像美化</span><span class="chip" data-quick="deblur">AI 去模糊</span><span class="chip" data-quick="preset">套用預設…</span><span class="chip" data-quick="film">軟片模擬…</span><span class="chip" data-quick="copy">複製設定</span><span class="chip ${S.clipboard ? '' : 'dis'}" data-quick="paste">貼上設定</span><span class="chip" data-quick="reset">重設修圖</span></div>
   <div class="hint" style="margin-top:10px">選取多張後按「貼上設定」或「套用預設」可整批修圖。</div>`;
   drawHist($('#libHist'), p.ai?.hist);
 }
@@ -446,7 +494,7 @@ async function aiRateAll() {
 
 // ─────────────────────────── 編輯畫面 ───────────────────────────
 let engine = null, bg = null;
-const E = { healMode: false, healR: 0.02, photo: null, edits: null, src: null, masks: null, maskState: 'none', undo: [], redo: [], split: null, zoom: 'fit', pan: [0.5, 0.5], tab: 'basic', hslTab: 'hslS', crop: false, hover: null, decodeToken: 0 };
+const E = { focusMode: false, healMode: false, healR: 0.02, photo: null, edits: null, src: null, masks: null, maskState: 'none', undo: [], redo: [], split: null, zoom: 'fit', pan: [0.5, 0.5], tab: 'basic', hslTab: 'hslS', crop: false, hover: null, decodeToken: 0 };
 const decodeCache = new Map(); // photoId -> {src, look}
 function bgEngine() { if (!bg) { const c = document.createElement('canvas'); c.width = c.height = 16; bg = new Engine(c); } return bg; }
 
@@ -464,7 +512,7 @@ async function openEdit(id) {
   if (E.photo && E.photo.id !== id) await commitEditThumb(E.photo);
   if (!engine) { try { engine = new Engine($('#cv')); } catch (err) { toast('無法啟動圖形引擎：' + err.message, 6000); return; } }
   S.focus = id; if (!S.sel.has(id) || S.sel.size <= 1) { S.sel.clear(); S.sel.add(id); }
-  E.photo = p; E.edits = { ...DEFAULT_EDITS(), ...clone(p.edits || {}) }; E.undo = []; E.redo = []; E.masks = null; E.maskState = 'none'; E.split = null; E.zoom = 'fit'; E.crop = false; E.healMode = false; E.healKey = '';
+  E.photo = p; E.edits = { ...DEFAULT_EDITS(), ...clone(p.edits || {}) }; E.undo = []; E.redo = []; E.masks = null; E.maskState = 'none'; E.split = null; E.zoom = 'fit'; E.crop = false; E.healMode = false; E.focusMode = false; E.healKey = ''; E.deblurDone = 0;
   renderEditSide(); renderEditBar(); renderTools(); renderFilm();
   const token = ++E.decodeToken;
   // 先顯示預覽圖
@@ -483,6 +531,7 @@ async function openEdit(id) {
     E.src = c.src;
     engine.setSource(c.src); engine.setBase(c.look.lut, c.look.sat);
     if ((E.edits.heal || []).length) { engine.prepare(E.edits); setBusy('套用物件移除…'); await sleep(20); refreshHeal(); }
+    if (E.edits.deblur) { engine.prepare(E.edits); scheduleDeblur(); }
     ph.classList.add('hidden'); $('#cv').style.visibility = 'visible';
     layoutCanvas(); draw();
     setBusy(null);
@@ -567,6 +616,7 @@ function setEdit(patch, opts = {}) {
   Object.assign(E.edits, patch);
   if ('slim' in patch || 'eyeEnlarge' in patch || 'waist' in patch || 'bodySlim' in patch) engine.setPins(pinsFor(E.masks?.pins, E.edits));
   if ('crop' in patch) layoutCanvas();
+  if ('deblur' in patch && !opts.noDeblur) scheduleDeblur();
   draw();
   clearTimeout(saveT); saveT = setTimeout(persistEdits, 500);
 }
@@ -610,7 +660,12 @@ function leaveEdit() { commitEditThumb(E.photo); }
 // ── 編輯畫面版面 ──
 function renderEditSide() {
   const all = [...BUILTIN_PRESETS, ...S.presets];
+  const fm = E.edits?.film;
+  const filmHTML = FILMS.map(f => f.brand ? '<h4 style="margin-top:14px">柯達底片模擬</h4>' : f.cat ? `<div class="hint" style="margin:10px 0 4px;color:#9a8">${f.cat}</div>` : `<div class="preset ${fm?.id === f.id ? 'on' : ''}" data-film="${f.id}"><div class="sw" style="background:${f.sw}"></div><span>${esc(f.name)}</span></div>`).join('');
   $('#editSide').innerHTML = `
+  <h4>富士底片模擬</h4>
+  ${fm ? `<div class="sl"><label>底片強度</label><input type="range" id="filmAmt" min="0" max="150" value="${fm.amt}"><em id="filmAmtV">${fm.amt}</em></div><div class="item add" id="filmOff">✕ 取消底片色調</div>` : '<div class="hint">只改變色彩風格，不影響曝光、白平衡與人像修飾</div>'}
+  ${filmHTML}
   <h4>預設集</h4>
   ${all.map(p => `<div class="preset" data-preset="${p.id}"><div class="sw" style="background:${p.sw || 'linear-gradient(135deg,#777,#333)'}"></div><span>${esc(p.name)}</span>${p.user ? `<span class="del" data-delpreset="${p.id}">刪除</span>` : ''}</div>`).join('')}
   <div class="item add" id="savePreset">＋ 從目前設定建立預設</div>
@@ -640,7 +695,7 @@ function renderFilmItem(id) { const el = document.querySelector(`.film .f[data-f
 const SL = (key, label, min, max, step = 1, fmt) => ({ key, label, min, max, step, fmt });
 const GROUPS = {
   basic: [
-    { title: '智慧增強', ai: true, items: [SL('enhance', '智慧增強', 0, 100)], note: '一個滑桿同時調整曝光、亮暗部、色彩、細節與天空（依照片內容分析）' },
+    { title: '智慧增強', ai: true, extra: '<span class="x" data-act="optimizeOne">✦ AI 最佳化這張</span>', items: [SL('enhance', '智慧增強', 0, 100)], note: '一個滑桿同時調整曝光、亮暗部、色彩、細節與天空（依照片內容分析）。「AI 最佳化這張」會自動判斷場景與主體，找出分數最高的調整。' },
     { title: '白平衡', extra: '<span class="x" data-act="autowb">自動</span>', items: [SL('temp', '色溫', -100, 100), SL('tint', '色調', -100, 100)] },
     { title: '光線', extra: '<span class="x" data-act="auto">✦ 自動調整</span>', items: [SL('exposure', '曝光', -5, 5, 0.05, v => (v > 0 ? '+' : '') + v.toFixed(2)), SL('contrast', '對比', -100, 100), SL('highlights', '亮部', -100, 100), SL('shadows', '暗部', -100, 100), SL('whites', '白色', -100, 100), SL('blacks', '黑色', -100, 100)] },
     { title: '色彩', items: [SL('vibrance', '自然飽和', -100, 100), SL('saturation', '飽和度', -100, 100)] },
@@ -666,7 +721,7 @@ const GROUPS = {
     { title: '色彩比對', ai: true, cm: true },
     { title: '黑白', bw: true }
   ],
-  local: [{ healUI: true }, { localUI: true }],
+  local: [{ refocusUI: true }, { healUI: true }, { localUI: true }],
   crop: [{ cropUI: true }]
 };
 const HAIR_COLORS = [['brown', '棕', '#7a4a2a'], ['chestnut', '栗', '#5a2e1a'], ['blonde', '金', '#d8b878'], ['ash', '霧灰', '#8c8478'], ['wine', '酒紅', '#7a1f35'], ['pink', '粉', '#d8899e'], ['black', '黑', '#1a1716'], ['gray', '銀灰', '#a8a8ad']];
@@ -675,10 +730,34 @@ const LOCAL_MASKS = [['person', '人物'], ['bg', '背景'], ['sky', '天空'], 
 const SKY_TYPES = [['blue', '藍天白雲'], ['clear', '晴朗無雲'], ['sunset', '夕陽'], ['dusk', '粉紫黃昏'], ['cloudy', '多雲']];
 const HSL_COLORS = [['紅', '#e05050'], ['橙', '#e98a3c'], ['黃', '#e0c040'], ['綠', '#5cb85c'], ['青', '#3fc1c9'], ['藍', '#4a7fe0'], ['紫', '#8a5ce0'], ['洋紅', '#d04fb0']];
 
+// 每個區塊對應的設定值，用來「單項重設」
+function groupKeys(g) {
+  if (g.refocusUI) return ['deblur', 'defocus', 'defocusR', 'focus', 'focusAmt', 'focusRange'];
+  if (g.healUI) return ['heal'];
+  if (g.localUI) return ['local'];
+  if (g.cropUI) return ['crop'];
+  return (g.items || []).map(i => i.key).concat(g.hsl ? ['hslH', 'hslS', 'hslL'] : [], g.curve ? ['curve'] : [], g.bw ? ['bw', 'bwFilter', 'bwToneH', 'bwToneS'] : [],
+    g.skyRep ? ['skyRep', 'skyType'] : [], g.cm ? ['cm', 'cmAmt'] : [], g.hair ? ['hairColor'] : [], g.bgRep ? ['bgRep', 'bgType', 'bgColor'] : [], g.mist ? ['mistWarm'] : []);
+}
+const sameVal = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+function resetKeys(keys, label) {
+  const d = DEFAULT_EDITS(); const patch = {}; keys.forEach(k => patch[k] = clone(d[k]));
+  if (keys.includes('crop') && typeof resetCropState === 'function') resetCropState();
+  setEdit(patch, { label }); if (engine && E.masks) engine.setPins(pinsFor(E.masks?.pins, E.edits));
+  if (keys.includes('heal') && typeof refreshHeal === 'function') refreshHeal();
+  if (keys.includes('deblur') && typeof scheduleDeblur === 'function') scheduleDeblur();
+  renderTools();
+}
+function resetGroup(g) {
+  const name = g.title || (g.refocusUI ? '重新對焦' : g.healUI ? '移除物件' : g.localUI ? '局部調整' : g.cropUI ? '裁切' : '');
+  resetKeys(groupKeys(g), '重設「' + name + '」');
+}
+function groupChanged(g) { const d = DEFAULT_EDITS(); return groupKeys(g).some(k => !sameVal(E.edits[k], d[k])); }
+function resetBtn(gi) { return `<span class="rst" data-rstg="${gi}" title="把這一項回復成原始設定">↺ 重設</span>`; }
 function sliderHTML(s) {
   const v = E.edits[s.key]; const changed = v !== DEFAULT_EDITS()[s.key];
   const txt = s.fmt ? s.fmt(v) : (v > 0 && s.min < 0 ? '+' : '') + Math.round(v);
-  return `<div class="sl"><label>${s.label}</label><input type="range" class="${changed ? 'ch' : ''}" data-k="${s.key}" min="${s.min}" max="${s.max}" step="${s.step}" value="${v}"><em data-v="${s.key}">${txt}</em></div>`;
+  return `<div class="sl"><label title="雙擊可重設">${s.label}</label><input type="range" class="${changed ? 'ch' : ''}" data-k="${s.key}" min="${s.min}" max="${s.max}" step="${s.step}" value="${v}"><em data-v="${s.key}" title="雙擊可重設">${txt}</em><span class="rsk ${changed ? '' : 'off'}" data-rstk="${s.key}" title="重設這個滑桿">↺</span></div>`;
 }
 function renderTools() {
   if (!E.photo) return;
@@ -686,11 +765,13 @@ function renderTools() {
   let html = `<div class="ttabs">${tabs.map(([k, l]) => `<div class="ttab ${E.tab === k ? 'on' : ''}" data-tab="${k}">${l}</div>`).join('')}</div>`;
   if (E.tab === 'basic') html += `<div class="sec"><div class="hist" style="height:80px"><canvas id="editHist" width="560" height="160"></canvas></div></div>`;
   if (E.tab === 'ai') html += `<div class="sec" id="maskStatus"></div>`;
-  for (const g of GROUPS[E.tab]) {
-    if (g.cropUI) { html += cropToolsHTML(); continue; }
-    if (g.healUI) { html += healToolsHTML(); continue; }
-    if (g.localUI) { html += localToolsHTML(); continue; }
-    html += `<div class="sec"><div class="t"><span>${g.title}${g.ai ? ' <span class="ai">AI</span>' : ''}</span>${g.extra || ''}</div>`;
+  const withRst = (h, gi, g) => groupChanged(g) ? h.replace(/(<div class="sec"><div class="t">[\s\S]*?)(<\/div>)/, `$1${resetBtn(gi)}$2`) : h;
+  for (const [gi, g] of GROUPS[E.tab].entries()) {
+    if (g.cropUI) { html += withRst(cropToolsHTML(), gi, g); continue; }
+    if (g.refocusUI) { html += withRst(refocusHTML(), gi, g); continue; }
+    if (g.healUI) { html += withRst(healToolsHTML(), gi, g); continue; }
+    if (g.localUI) { html += withRst(localToolsHTML(), gi, g); continue; }
+    html += `<div class="sec"><div class="t"><span>${g.title}${g.ai ? ' <span class="ai">AI</span>' : ''}</span><span class="tx">${g.extra || ''}${groupChanged(g) ? resetBtn(gi) : ''}</span></div>`;
     if (g.items) html += g.items.map(sliderHTML).join('');
     if (g.note) html += `<div class="hint">${g.note}</div>`;
     if (g.mist) html += `<div class="chips" style="margin-top:6px">${[['1/8', 30], ['1/4', 55], ['1/2', 85], ['1', 100]].map(([l, v]) => `<span class="chip ${E.edits.mist === v ? 'on' : ''}" data-mist="${v}">${l}</span>`).join('')}<span class="chip ${E.edits.mistWarm !== false ? 'on' : ''}" data-act="mistWarm">${E.edits.mistWarm !== false ? '✓ ' : ''}暖色光暈</span></div><div class="hint">模擬 Black Pro-Mist 濾鏡：亮部柔柔散開、暗部維持深黑，人像與夜景特別有電影感</div>`;
@@ -721,6 +802,20 @@ function renderMaskStatus() {
   el.innerHTML = E.maskState === 'loading' ? '<div class="t"><span><span class="spin" style="display:inline-block;vertical-align:middle;margin-right:6px"></span>AI 正在分析人臉與主體…</span></div>'
     : E.maskState === 'ready' ? `<div class="t"><span>偵測結果</span></div><div class="hint">人臉 ${m.faces} 人 · ${m.hasPerson ? '已分離主體與背景' : '未偵測到人物主體'}${m.faces ? '' : '<br>沒有偵測到人臉，人像修飾不會作用；背景模糊、主體補光、天空仍可使用。'}</div>`
       : E.maskState === 'error' ? '<div class="hint">AI 分析失敗，可以換一張照片再試。</div>' : '';
+}
+function refocusHTML() {
+  const e = E.edits;
+  return `<div class="sec"><div class="t"><span>重新對焦｜救回失焦 <span class="ai">AI</span></span></div>
+  <div class="hint" style="margin-bottom:6px"><b>AI 去模糊</b>：用 NAFNet 神經網路還原手震、動態模糊與輕微失焦。</div>
+  ${sliderHTML(SL('deblur', 'AI 去模糊', 0, 100))}
+  <div class="hint" style="margin:8px 0 6px"><b>失焦還原</b>：用反卷積把散開的光點收回來，適合對焦偏掉的照片。模糊半徑請調到眼睛、睫毛最銳利、但還沒出現白邊的位置。</div>
+  ${sliderHTML(SL('defocus', '還原強度', 0, 100))}${sliderHTML(SL('defocusR', '模糊半徑', 0, 100))}
+  </div>
+  <div class="sec"><div class="t"><span>重新對焦｜改變焦點 <span class="ai">AI</span></span></div>
+  <div class="hint" style="margin-bottom:6px">用 AI 深度圖（Depth Anything V2）判斷遠近，點畫面選擇要清楚的位置，其他地方依距離自然模糊，亮點會變成光斑。</div>
+  <div style="display:flex;gap:6px;margin-bottom:6px"><div class="btn sm ${E.focusMode ? 'on' : 'p'}" data-act="focusPick">${E.focusMode ? '✓ 點畫面選焦點…' : '🎯 點選對焦位置'}</div>${e.focus ? '<div class="btn sm" data-act="focusClear">取消</div>' : ''}</div>
+  ${sliderHTML(SL('focusAmt', '背景模糊量', 0, 100))}${sliderHTML(SL('focusRange', '景深範圍', 0, 100))}
+  <div class="hint">${E.masks ? (E.masks.hasDepth ? (e.focus ? '已設定焦點' : '尚未選擇焦點') : '深度估計失敗，無法使用') : 'AI 分析深度中…'}</div></div>`;
 }
 function healToolsHTML() {
   const ops = E.edits.heal || [];
@@ -845,6 +940,18 @@ function bindSplit() {
   $('#splitLine').addEventListener('pointerup', () => d = false);
 }
 
+// ── 改變焦點：點畫面 → 轉回來源座標 ──
+function pickFocus(ev) {
+  const r = $('#cv').getBoundingClientRect(); const ox = (ev.clientX - r.left) / r.width, oy = (ev.clientY - r.top) / r.height;
+  const c = E.edits.crop, v = E.view || [0.5, 0.5, 1, 1];
+  const qx = v[0] + (ox - 0.5) * v[2], qy = v[1] + (oy - 0.5) * v[3];
+  const W = engine.srcW, H = engine.srcH; let px = (qx - 0.5) * c.w * W, py = (qy - 0.5) * c.h * H;
+  const a = (c.angle || 0) * Math.PI / 180; const rx = Math.cos(a) * px - Math.sin(a) * py, ry = Math.sin(a) * px + Math.cos(a) * py;
+  const sx = (c.cx * W + rx) / W, sy = (c.cy * H + ry) / H;
+  setEdit({ focus: { x: sx, y: sy }, focusAmt: E.edits.focusAmt || 60 }, { label: '改變焦點' });
+  E.focusMode = false; renderTools();
+}
+
 // ── 物件移除筆刷 ──
 let healStroke = null;
 function healCanvas() {
@@ -866,11 +973,31 @@ async function healUp() {
 }
 function refreshHeal() {
   const c = decodeCache.get(E.photo?.id); if (!c) return;
-  const key = JSON.stringify(E.edits.heal || []); if (key === E.healKey) return; E.healKey = key;
+  const key = JSON.stringify([E.edits.heal || [], E.deblurDone || 0]); if (key === E.healKey) return; E.healKey = key;
   const t0 = performance.now();
-  const src = (E.edits.heal || []).length ? applyHeals(c.src, E.edits.heal) : c.src;
+  const base = E.deblurDone && c.deblurred ? c.deblurred : c.src;
+  const src = (E.edits.heal || []).length ? applyHeals(base, E.edits.heal) : base;
   engine.updateSource(src); draw();
   console.log('heal ms', Math.round(performance.now() - t0));
+}
+// AI 去模糊：滑桿停下來後才計算（神經網路較慢）
+let deblurT = 0, deblurRun = 0;
+function scheduleDeblur() {
+  clearTimeout(deblurT);
+  deblurT = setTimeout(async () => {
+    const c = decodeCache.get(E.photo?.id); if (!c) return;
+    const amt = E.edits.deblur || 0; const run = ++deblurRun;
+    if (!amt) { E.deblurDone = 0; refreshHeal(); return; }
+    try {
+      if (!c.deblurFull) { setBusy('AI 去模糊運算中… 0%'); c.deblurFull = await deblurAI(c.src, 1, (p) => setBusy(`AI 去模糊運算中（${mlBackend === 'webgpu' ? '顯示卡' : 'CPU'}）… ${Math.round(p * 100)}%`), () => run !== deblurRun); }
+      if (run !== deblurRun) return;
+      // 依強度混合
+      const s0 = c.src.data, s1 = c.deblurFull.data, out = new s0.constructor(s0.length); const k = amt / 100;
+      for (let i = 0; i < s0.length; i++) out[i] = s0[i] + (s1[i] - s0[i]) * k;
+      c.deblurred = { ...c.src, data: out }; E.deblurDone = amt; E.healKey = ''; refreshHeal();
+    } catch (err) { if (!/取消/.test(err.message)) { console.warn(err); toast('AI 去模糊失敗：' + err.message, 5000); } }
+    setBusy(null);
+  }, 500);
 }
 async function autoLines() {
   if (!E.masks) { toast('AI 還在分析，請稍候'); return; }
@@ -970,6 +1097,25 @@ function aiCrop() {
 }
 
 // ── 預設集 ──
+function filmPatch(id, amt) {
+  const f = FILMS.find(x => x.id === id); const d = DEFAULT_EDITS(); const k = amt / 100; const out = {};
+  for (const key of FILM_LOOK_KEYS) {
+    const v = f.e[key], dv = d[key];
+    if (v === undefined) out[key] = clone(dv);
+    else if (typeof v === 'number' && typeof dv === 'number' && !/^grade.H$|bwToneH/.test(key)) out[key] = Math.round((dv + (v - dv) * k) * 100) / 100;
+    else if (Array.isArray(v) && key !== 'curve') out[key] = v.map((x, i) => Math.round(x * k));
+    else if (key === 'curve') out[key] = v.map(([a, b]) => [a, Math.min(1, Math.max(0, a + (b - a) * Math.min(k, 1.5)))]);
+    else out[key] = clone(v);
+  }
+  if (/S$/.test('gradeSS')) { out.gradeSS = Math.round((f.e.gradeSS || 0) * k); out.gradeHS = Math.round((f.e.gradeHS || 0) * k); }
+  out.film = { id, amt };
+  return out;
+}
+function applyFilm(id, amt = 100, hover = false) {
+  const p = filmPatch(id, amt);
+  if (hover) { E.hover = { ...E.edits, ...p }; draw(); return; }
+  setEdit(p, { label: '底片：' + FILMS.find(x => x.id === id).name }); renderTools(); renderEditSide();
+}
 function presetEdits(pr) { const d = DEFAULT_EDITS(); const e = { ...d, ...clone(pr.e) }; return e; }
 function applyPresetToCurrent(pr) { const keep = { crop: E.edits.crop }; setEdit({ ...presetEdits(pr), ...keep }, { label: '套用預設：' + pr.name }); renderTools(); document.querySelectorAll('.preset').forEach(el => el.classList.toggle('on', el.dataset.preset === pr.id)); }
 async function savePresetFromCurrent() {
@@ -1022,6 +1168,7 @@ async function renderPhotoOffscreen(p, fn, half, opts) {
     let jb = null; try { jb = await (await fetch(origPreviewURL(p))).blob(); } catch {}
     look = await cameraLook(src, jb);
   }
+  if (edits.deblur) src = await deblurAI(src, edits.deblur / 100, opts?.onDeblur);
   if ((edits.heal || []).length) src = applyHeals(src, edits.heal);
   const eng = bgEngine(); eng.setSource(src); eng.setBase(look.lut, look.sat);
   const needAI = needsAI(edits) || (opts && opts.alpha);
@@ -1034,6 +1181,75 @@ async function renderPhotoOffscreen(p, fn, half, opts) {
   } else if (edits.enhance && !edits.enhanceVec) edits.enhanceVec = enhanceVector(eng, edits, null);
   await fn(eng, edits);
   eng.dispose();
+}
+
+// ─────────────────────────── AI 最佳化修圖 ───────────────────────────
+async function optimizeCurrent() {
+  const c = decodeCache.get(E.photo?.id); if (!c || !engine?.srcTex) return;
+  if (!E.masks) { toast('AI 還在分析主體，請稍候再按'); return; }
+  setBusy('AI 判斷場景、主體與最佳曝光…'); await sleep(30);
+  try {
+    const r = optimize(c.src, c.look, E.masks, E.photo.info, { portrait: true, skinStyle: S.settings.skinStyle || 'asian' });
+    const keep = { crop: E.edits.crop, heal: E.edits.heal, local: E.edits.local, deblur: E.edits.deblur, focus: E.edits.focus, focusAmt: E.edits.focusAmt };
+    setEdit({ ...r.edits, ...keep }, { label: 'AI 最佳化（' + SCENE_NAMES[r.scene.scene] + '）' });
+    engine.setPins(pinsFor(E.masks.pins, E.edits)); layoutCanvas(); renderTools();
+    toast(`判斷為「${SCENE_NAMES[r.scene.scene]}」，已套用最佳化修圖`, 3500);
+  } catch (err) { console.error(err); toast('最佳化失敗：' + err.message, 5000); }
+  setBusy(null);
+}
+function aiOptimizeDialog(ids) {
+  if (!ids.length) return;
+  const m = $('#modal');
+  m.innerHTML = `<div class="modal"><h3>✦ AI 最佳化修圖（${ids.length} 張）</h3>
+  <div class="hint" style="margin-bottom:10px">每張照片會分別判斷場景（人像、團體、風景、夕陽、夜景、室內）、主體位置與曝光，再自動找出分數最高的白平衡、曝光、亮暗部、對比與色彩，並依場景加上合適的效果（例如人像修膚、風景天空、夜景降噪、逆光主體補光）。</div>
+  <div class="row"><label>強度</label><select id="oStr"><option value="0.6">輕微</option><option value="1" selected>標準</option><option value="1.25">強烈</option></select></div>
+  <div class="row"><label>膚色風格</label><select id="oSkin"><option value="asian">亞洲｜白裡透紅（不死白）</option><option value="natural">自然膚色</option><option value="tan">小麥健康膚色</option></select></div>
+  <div class="row"><label>人像美顏</label><label style="width:auto"><input type="checkbox" id="oPor" checked> 有人臉時自動修膚、亮眼、去黑眼圈</label></div>
+  <div class="row"><label>原有修圖</label><select id="oKeep"><option value="replace">重新最佳化（保留裁切、移除物件）</option><option value="merge">只最佳化光線與色彩，保留其他效果</option></select></div>
+  <div class="acts"><div class="btn" id="oNo">取消</div><div class="btn p" id="oGo">開始</div></div></div>`;
+  m.classList.remove('hidden');
+  $('#oNo').onclick = () => m.classList.add('hidden');
+  $('#oSkin').value = S.settings.skinStyle || 'asian';
+  $('#oGo').onclick = () => { S.settings.skinStyle = $('#oSkin').value; saveSettings(); runOptimize(ids, { strength: +$('#oStr').value, portrait: $('#oPor').checked, keep: $('#oKeep').value, skinStyle: $('#oSkin').value }); };
+}
+const LIGHT_KEYS = ['temp', 'tint', 'exposure', 'contrast', 'highlights', 'shadows', 'whites', 'blacks', 'vibrance', 'saturation', 'subjectLight', 'skinHue', 'skinSat', 'skinLum'];
+async function runOptimize(ids, opt) {
+  const m = $('#modal'); let stop = false;
+  m.innerHTML = `<div class="modal"><h3>AI 最佳化修圖中…</h3><div id="oMsg" class="hint">準備中</div><div class="prog" style="width:100%;margin:14px 0"><b id="oBar"></b></div><div id="oLog" class="hint" style="max-height:160px;overflow:auto"></div><div class="acts"><div class="btn" id="oStop">停止</div></div></div>`;
+  $('#oStop').onclick = () => { stop = true; $('#oStop').textContent = '停止中…'; };
+  await initAI();
+  const counts = {}; let done = 0;
+  for (const id of ids) {
+    if (stop) break;
+    const p = photoById(id); if (!p) continue;
+    $('#oMsg').textContent = `${done + 1} / ${ids.length}　${p.name}`;
+    try {
+      let c = decodeCache.get(p.id);
+      let src = c?.src, look = c?.look;
+      if (!src) { src = p.isRaw ? await decodeRaw(p.path, true) : await decodeImage(p.path); let jb = null; try { jb = await (await fetch(origPreviewURL(p))).blob(); } catch {} look = await cameraLook(src, jb); }
+      const old = { ...DEFAULT_EDITS(), ...clone(p.edits || {}) };
+      if ((old.heal || []).length) src = applyHeals(src, old.heal);
+      const eng = bgEngine(); eng.setSource(src); eng.setBase(look.lut, look.sat);
+      const s = Math.min(1, 1536 / Math.max(src.width, src.height));
+      const img = eng.renderPixels({ ...DEFAULT_EDITS(), sharpen: 0, colorNoise: 0 }, Math.round(src.width * s), Math.round(src.height * s));
+      const masks = await buildMasks(img);
+      const r = optimize(src, look, masks, p.info, opt);
+      let ne;
+      if (opt.keep === 'merge') { ne = { ...old }; for (const k of LIGHT_KEYS) ne[k] = r.edits[k] ?? 0; }
+      else ne = { ...r.edits, crop: old.crop, heal: old.heal, deblur: old.deblur };
+      p.edits = ne; p.ai = { ...(p.ai || {}), scene: r.scene.scene };
+      await api.updatePhotos(S.cur.id, [p.id], { edits: ne, ai: p.ai });
+      eng.setMasks(masks); eng.setPins(pinsFor(masks.pins, ne));
+      await writeEditedThumbs(p, eng, ne);
+      eng.dispose();
+      if (E.photo?.id === p.id && S.view === 'edit') { E.edits = { ...DEFAULT_EDITS(), ...clone(ne) }; engine.setPins(pinsFor(E.masks?.pins, E.edits)); draw(); renderTools(); }
+      const sn = SCENE_NAMES[r.scene.scene]; counts[sn] = (counts[sn] || 0) + 1;
+      $('#oLog').insertAdjacentHTML('afterbegin', `<div>${esc(p.name)}：${sn}${r.edits.subjectLight ? '・逆光補光' : ''}${r.edits.denoise ? '・高 ISO 降噪' : ''}</div>`);
+    } catch (err) { console.error(err); $('#oLog').insertAdjacentHTML('afterbegin', `<div style="color:#e66">${esc(p.name)}：失敗（${esc(err.message)}）</div>`); }
+    done++; $('#oBar').style.width = Math.round(done / ids.length * 100) + '%';
+  }
+  m.innerHTML = `<div class="modal"><h3>${stop ? '已停止' : 'AI 最佳化完成'}</h3><div class="hint">處理 ${done} 張：${Object.entries(counts).map(([k, v]) => `${k} ${v} 張`).join('、') || '—'}</div><div class="hint" style="margin-top:6px">每張的修圖都可以再進入編輯微調；不滿意可以在照片上按右鍵選「重設修圖」。</div><div class="acts"><div class="btn p" id="oClose">完成</div></div></div>`;
+  $('#oClose').onclick = () => { m.classList.add('hidden'); if (S.view === 'lib') { renderGrid(); renderInfo(); } else renderFilm(); };
 }
 
 // ─────────────────────────── 匯出 ───────────────────────────
@@ -1097,7 +1313,7 @@ async function runExport(ids, opt) {
         const blob = await oc.convertToBlob(png ? { type: 'image/png' } : { type: 'image/jpeg', quality: opt.quality / 100 });
         const base = opt.naming === 'seq' ? `${S.cur.name}_${String(done + 1).padStart(3, '0')}` : p.name.replace(/\.[^.]+$/, '');
         await api.writeExport(opt.dir, base.replace(/[\\/:*?"<>|]/g, '_') + (png ? '.png' : '.jpg'), await blob.arrayBuffer());
-      }, half, { alpha: opt.fmt === 'pngA' });
+      }, half, { alpha: opt.fmt === 'pngA', onDeblur: (pp) => { $('#xMsg').textContent = `${done + 1} / ${ids.length}　${p.name}　AI 去模糊 ${Math.round(pp * 100)}%`; } });
     } catch (err) { console.error(err); fail++; }
     done++;
     $('#xBar').style.width = Math.round(done / ids.length * 100) + '%';
@@ -1123,11 +1339,35 @@ function askText(title, label, def) {
   });
 }
 function showMenu(x, y, items) {
-  const m = $('#menu');
-  m.innerHTML = items.map((it, i) => it === '-' ? '<hr>' : `<div data-mi="${i}">${esc(it[0])}</div>`).join('');
+  // 項目格式：'-' 分隔線、{ head: '標題' } 群組標題、[名稱, 動作] 或 [名稱, null, 子選單項目]（滑鼠移上展開子選單）
+  const m = $('#menu'); const acts = [];
+  const build = (list) => list.map((it) => {
+    if (it === '-') return '<hr>';
+    if (it.head) return `<div class="mh">${esc(it.head)}</div>`;
+    if (it[2]) return `<div class="msub">${esc(it[0])}<span class="arr">▸</span><div class="menu subm${it[2].some(x => Array.isArray(x) && x[2]) ? '' : ' leaf'}">${build(it[2])}</div></div>`;
+    acts.push(it[1]); return `<div data-mi="${acts.length - 1}">${esc(it[0])}</div>`;
+  }).join('');
+  m.innerHTML = build(items);
   m.classList.remove('hidden');
-  m.style.left = Math.min(x, innerWidth - 200) + 'px'; m.style.top = Math.min(y, innerHeight - m.offsetHeight - 10) + 'px';
-  m.onclick = (e) => { const i = e.target.dataset.mi; if (i != null) { m.classList.add('hidden'); items[i][1](); } };
+  m.style.left = Math.min(x, innerWidth - 220) + 'px'; m.style.top = Math.max(4, Math.min(y, innerHeight - m.offsetHeight - 10)) + 'px';
+  // 子選單位置：放不下右邊就開在左邊、超出底部就往上移
+  m.querySelectorAll('.msub').forEach(el => el.onmouseenter = () => {
+    const sm = el.querySelector(':scope > .subm'); sm.style.left = ''; sm.style.right = ''; sm.style.top = '-6px';
+    const r = el.getBoundingClientRect();
+    if (r.right + sm.offsetWidth > innerWidth - 4) { sm.style.left = 'auto'; sm.style.right = '100%'; }
+    const over = r.top - 6 + sm.offsetHeight - (innerHeight - 6); if (over > 0) sm.style.top = (-6 - over) + 'px';
+  });
+  m.onclick = (e) => { const t = e.target.closest('[data-mi]'); if (t) { m.classList.add('hidden'); acts[+t.dataset.mi](); } };
+}
+function filmMenuItems(ids) {
+  const groups = []; let brand = null, cur = null;
+  for (const f of FILMS) {
+    if (f.brand || !brand) { brand = { name: f.brand === 'kodak' ? '柯達 Kodak' : '富士 Fujifilm', items: [] }; groups.push(brand); if (f.brand) continue; }
+    if (f.cat) { brand.items.push({ head: f.cat.replace(/^柯達｜/, '') }); continue; }
+    brand.items.push([f.name, () => applyToPhotos(ids, (b) => ({ ...b, ...filmPatch(f.id, 100) }), '底片：' + f.name)]);
+  }
+  const off = ['取消底片色調', () => applyToPhotos(ids, (b) => { const d = DEFAULT_EDITS(); const o = { ...b }; FILM_LOOK_KEYS.forEach(k => o[k] = clone(d[k])); o.film = null; return o; }, '取消底片色調')];
+  return [...groups.map(g => [g.name, null, g.items]), '-', off];
 }
 function presetMenu(x, y, ids) {
   const all = [...BUILTIN_PRESETS, ...S.presets];
@@ -1143,12 +1383,14 @@ function bindGlobal() {
 
   // 圖庫左側
   $('#libSide').addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-proj],[data-folder],[data-smart],[data-rating],[data-flag],[data-edited],[data-cam],[data-color],#newProj,#aiPickAll,#aiRateAll');
+    const t = e.target.closest('[data-proj],[data-folder],[data-smart],[data-rating],[data-flag],[data-edited],[data-cam],[data-color],#newProj,#aiPickAll,#aiRateAll,#fixBlur,#reAnalyze');
     if (!t) return;
     const f = S.filter;
     if (t.id === 'newProj') { const n = await askText('建立專案', '專案名稱', defaultProjectName()); if (n) await createProject(n); return; }
     if (t.id === 'aiPickAll') { aiPickAll(); return; }
     if (t.id === 'aiRateAll') { aiRateAll(); return; }
+    if (t.id === 'reAnalyze') { for (const p of S.photos) if (p.ai) p.ai.analyzed = false; toast('重新分析中…'); runAI(S.cur.id); return; }
+    if (t.id === 'fixBlur') { const ids = filtered().map(p => p.id); applyToPhotos(ids, (b) => ({ ...b, deblur: 70, defocus: b.defocus || 40 }), 'AI 救回模糊'); return; }
     if (t.dataset.proj) { if (t.dataset.proj !== S.cur?.id) await openProject(t.dataset.proj); return; }
     if (t.dataset.folder) f.folder = t.dataset.folder === '__all' ? null : t.dataset.folder;
     if (t.dataset.smart) f.smart = f.smart === t.dataset.smart ? null : t.dataset.smart;
@@ -1183,9 +1425,12 @@ function bindGlobal() {
     if (!S.sel.has(t.dataset.id)) select(t.dataset.id);
     const ids = targets();
     showMenu(e.clientX, e.clientY, [
+      [`✦ AI 最佳化修圖（${ids.length} 張）`, () => aiOptimizeDialog(ids)],
       ['編輯', () => switchView('edit')],
       ['複製修圖設定', () => copySettings()], ['貼上修圖設定', () => pasteSettings(ids)],
-      ['套用預設…', () => presetMenu(e.clientX, e.clientY, ids)], ['一鍵人像美化', () => applyToPhotos(ids, (b) => ({ ...b, ...beautyPatch() }), '一鍵人像美化')],
+      ['套用預設…', () => presetMenu(e.clientX, e.clientY, ids)],
+      ['軟片模擬', null, filmMenuItems(ids)], ['一鍵人像美化', () => applyToPhotos(ids, (b) => ({ ...b, ...beautyPatch() }), '一鍵人像美化')],
+      ['AI 去模糊（救回失焦）', () => applyToPhotos(ids, (b) => ({ ...b, deblur: 70 }), 'AI 去模糊')],
       ['重設修圖', () => applyToPhotos(ids, (b) => ({ ...DEFAULT_EDITS(), crop: b.crop }), '重設修圖')],
       '-', ['在檔案總管中顯示', () => api.reveal(photoById(ids[0]).path)],
       ['從專案移除（不刪原始檔）', async () => { if (!(await api.confirm(`從專案移除 ${ids.length} 張照片？`, '原始檔案不會被刪除。'))) return; await api.removePhotos(S.cur.id, ids); S.photos = S.photos.filter(p => !ids.includes(p.id)); S.sel.clear(); renderLibrary(); }]
@@ -1202,9 +1447,12 @@ function bindGlobal() {
     if (q === 'copy') copySettings();
     if (q === 'paste') pasteSettings(ids);
     if (q === 'reset') applyToPhotos(ids, (b) => ({ ...DEFAULT_EDITS(), crop: b.crop }), '重設修圖');
+    if (q === 'optimize') aiOptimizeDialog(ids);
+    if (q === 'deblur') applyToPhotos(ids, (b) => ({ ...b, deblur: 70 }), 'AI 去模糊');
     if (q === 'beauty') applyToPhotos(ids, (b) => ({ ...b, ...beautyPatch() }), '一鍵人像美化');
     if (q === 'auto') { S.focus && switchView('edit'); setTimeout(() => engine?.srcTex && autoAdjust(), 1500); }
     if (q === 'preset') { const r = t.getBoundingClientRect(); e.stopPropagation(); presetMenu(r.left, r.bottom, ids); }
+    if (q === 'film') { const r = t.getBoundingClientRect(); e.stopPropagation(); showMenu(r.left, r.bottom, filmMenuItems(ids)); }
   });
 
   // 拖放匯入
@@ -1222,21 +1470,28 @@ function bindGlobal() {
   $('#tools').addEventListener('input', (e) => {
     const t = e.target;
     if (t.dataset.k === 'enhance' && !E.edits.enhanceVec && engine?.srcTex) E.edits.enhanceVec = enhanceVector(engine, E.edits, E.masks);
-    if (t.dataset.k) { const k = t.dataset.k; let v = parseFloat(t.value); setEdit({ [k]: v }, { label: t.closest('.sl').querySelector('label').textContent }); const s = Object.values(GROUPS).flat().flatMap(g => g.items || []).find(x => x.key === k); const em = t.parentElement.querySelector('em'); em.textContent = s?.fmt ? s.fmt(v) : (v > 0 && (s ? s.min < 0 : false) ? '+' : '') + Math.round(v); t.classList.toggle('ch', v !== DEFAULT_EDITS()[k]); }
+    if (t.dataset.k) { const k = t.dataset.k; let v = parseFloat(t.value); setEdit({ [k]: v }, { label: t.closest('.sl').querySelector('label').textContent }); const s = Object.values(GROUPS).flat().flatMap(g => g.items || []).find(x => x.key === k); const em = t.parentElement.querySelector('em'); em.textContent = s?.fmt ? s.fmt(v) : (v > 0 && (s ? s.min < 0 : false) ? '+' : '') + Math.round(v); t.classList.toggle('ch', v !== DEFAULT_EDITS()[k]); t.parentElement.querySelector('.rsk')?.classList.toggle('off', v === DEFAULT_EDITS()[k]); }
     if (t.dataset.hk) { const arr = [...E.edits[t.dataset.hk]]; arr[+t.dataset.i] = +t.value; setEdit({ [t.dataset.hk]: arr }, { label: 'HSL' }); t.parentElement.querySelector('em').textContent = (t.value > 0 ? '+' : '') + t.value; }
     if (t.dataset.lk) { const L = clone(E.edits.local); L[+t.dataset.li][t.dataset.lk] = +t.value; setEdit({ local: L }, { label: '局部調整' }); t.parentElement.querySelector('em').textContent = (t.value > 0 ? '+' : '') + t.value; }
     if (t.id === 'healR') { E.healR = +t.value; $('#healRv').textContent = Math.round(E.healR * 1000); }
     if (t.id === 'bgColor') { setEdit({ bgType: 'custom', bgColor: t.value, bgRep: E.edits.bgRep || 100 }, { label: '背景顏色' }); }
     if (t.id === 'angle') { setEdit({ crop: { ...E.edits.crop, angle: +t.value } }, { label: '拉直' }); $('#angleV').textContent = (+t.value).toFixed(1) + '°'; }
   });
+  // 放開滑桿後，若區塊標題還沒有「重設」按鈕就重畫一次讓它出現（或在全部歸零時消失）
+  $('#tools').addEventListener('change', (e) => {
+    const t = e.target; if (!t.matches('input[type=range]')) return; const sec = t.closest('.sec'); if (!sec) return;
+    const has = !!sec.querySelector('.t .rst'); const g = GROUPS[E.tab]?.find(gg => (gg.items || []).some(i => i.key === t.dataset.k) || (gg.hsl && t.dataset.hk) || (gg.refocusUI && ['deblur', 'defocus', 'defocusR', 'focusAmt', 'focusRange'].includes(t.dataset.k)));
+    if (g && has !== groupChanged(g)) { const st = $('#tools').scrollTop; renderTools(); $('#tools').scrollTop = st; }
+  });
   $('#tools').addEventListener('dblclick', (e) => {
+    const lb = e.target.closest('.sl > label, .sl > em'); if (lb) { const r = lb.parentElement.querySelector('input[data-k]'); if (r) { resetKeys([r.dataset.k], '重設 ' + lb.parentElement.querySelector('label').textContent); return; } }
     const t = e.target.closest('input[type=range]'); if (!t) return;
     if (t.dataset.k) { setEdit({ [t.dataset.k]: DEFAULT_EDITS()[t.dataset.k] }, { label: '重設' }); renderTools(); }
     if (t.dataset.hk) { const arr = [...E.edits[t.dataset.hk]]; arr[+t.dataset.i] = 0; setEdit({ [t.dataset.hk]: arr }); renderTools(); }
     if (t.id === 'angle') { setEdit({ crop: { ...E.edits.crop, angle: 0 } }); renderTools(); }
   });
   $('#tools').addEventListener('click', (e) => {
-    const t = e.target.closest('[data-tab],[data-hsl],[data-act],[data-aspect],[data-skytype],[data-mist],[data-hair],[data-bgtype],[data-addlocal],[data-dellocal],[data-delheal]'); if (!t) return;
+    const t = e.target.closest('[data-rstg],[data-rstk],[data-tab],[data-hsl],[data-act],[data-aspect],[data-skytype],[data-mist],[data-hair],[data-bgtype],[data-addlocal],[data-dellocal],[data-delheal]'); if (!t) return;
     if (t.dataset.tab) { E.tab = t.dataset.tab; if (E.tab !== 'crop' && E.crop) { E.crop = false; layoutCanvas(); draw(); } renderTools(); }
     if (t.dataset.hsl) { E.hslTab = t.dataset.hsl; renderTools(); }
     if (t.dataset.aspect) { setEdit({ crop: fitAspect({ ...E.edits.crop, aspect: t.dataset.aspect }, t.dataset.aspect) }, { label: '裁切比例' }); if (!E.crop) { E.crop = true; layoutCanvas(); draw(); } renderTools(); }
@@ -1246,14 +1501,19 @@ function bindGlobal() {
     if (t.dataset.addlocal) { const L = [...(E.edits.local || [])]; if (L.length >= 4) { toast('最多 4 個局部調整'); return; } L.push({ mask: t.dataset.addlocal, exp: 0, con: 0, sat: 0, temp: 0 }); setEdit({ local: L }, { label: '新增局部調整' }); renderTools(); }
     if (t.dataset.dellocal) { const L = [...E.edits.local]; L.splice(+t.dataset.dellocal, 1); setEdit({ local: L }, { label: '刪除局部調整' }); renderTools(); }
     if (t.dataset.delheal) { const H = [...E.edits.heal]; H.splice(+t.dataset.delheal, 1); setEdit({ heal: H }, { label: '刪除修補' }); refreshHeal(); renderTools(); }
+    if (t.dataset.rstg != null) { resetGroup(GROUPS[E.tab][+t.dataset.rstg]); return; }
+    if (t.dataset.rstk) { resetKeys([t.dataset.rstk], '重設 ' + (t.closest('.sl')?.querySelector('label')?.textContent || '')); return; }
     if (t.dataset.mist) { setEdit({ mist: +t.dataset.mist }, { label: '黑柔濾鏡 ' + t.textContent }); renderTools(); }
     if (a === 'mistWarm') { setEdit({ mistWarm: E.edits.mistWarm === false }, { label: '暖色光暈' }); renderTools(); }
+    if (a === 'focusPick') { E.focusMode = !E.focusMode; E.healMode = false; layoutCanvas(); draw(); renderTools(); }
+    if (a === 'focusClear') { setEdit({ focus: null }, { label: '取消焦點' }); renderTools(); }
     if (a === 'healToggle') { E.healMode = !E.healMode; layoutCanvas(); draw(); renderTools(); }
     if (a === 'autoLines') autoLines();
     if (t.dataset.skytype) { setEdit({ skyType: t.dataset.skytype, skyRep: E.edits.skyRep || 80 }, { label: '天空替換' }); renderTools(); }
     if (a === 'cmPick') { const r = t.getBoundingClientRect(); e.stopPropagation(); pickColorRef(r.left, r.bottom); }
     if (a === 'cmClear') { setEdit({ cm: null, cmAmt: 0 }, { label: '清除色彩比對' }); renderTools(); }
     if (a === 'aiCrop') aiCrop();
+    if (a === 'optimizeOne') optimizeCurrent();
     if (a === 'auto') autoAdjust();
     if (a === 'autowb') autoWB();
     if (a === 'beauty') { setEdit(beautyPatch(), { label: '一鍵人像美化' }); renderTools(); }
@@ -1272,11 +1532,14 @@ function bindGlobal() {
   });
   $('#editSide').addEventListener('click', async (e) => {
     const del = e.target.closest('[data-delpreset]'); if (del) { e.stopPropagation(); S.presets = S.presets.filter(p => p.id !== del.dataset.delpreset); await api.savePresets(S.presets); renderEditSide(); return; }
+    const fl = e.target.closest('[data-film]'); if (fl) { E.hover = null; applyFilm(fl.dataset.film, E.edits.film?.amt || 100); return; }
+    if (e.target.closest('#filmOff')) { const d = DEFAULT_EDITS(); const patch = {}; FILM_LOOK_KEYS.forEach(k => patch[k] = d[k]); patch.film = null; setEdit(patch, { label: '取消底片色調' }); renderTools(); renderEditSide(); return; }
     const t = e.target.closest('[data-preset]'); if (t) { const pr = [...BUILTIN_PRESETS, ...S.presets].find(p => p.id === t.dataset.preset); E.hover = null; applyPresetToCurrent(pr); }
     if (e.target.closest('#savePreset')) savePresetFromCurrent();
   });
-  $('#editSide').addEventListener('mouseover', (e) => { const t = e.target.closest('[data-preset]'); if (!t || !engine?.srcTex) return; const pr = [...BUILTIN_PRESETS, ...S.presets].find(p => p.id === t.dataset.preset); E.hover = { ...presetEdits(pr), crop: E.edits.crop }; if (E.hover.slim || E.hover.eyeEnlarge) {} draw(); });
-  $('#editSide').addEventListener('mouseout', (e) => { const t = e.target.closest('[data-preset]'); if (!t) return; if (t.contains(e.relatedTarget)) return; E.hover = null; draw(); });
+  $('#editSide').addEventListener('input', (e) => { if (e.target.id === 'filmAmt' && E.edits.film) { const v = +e.target.value; $('#filmAmtV').textContent = v; const p = filmPatch(E.edits.film.id, v); setEdit(p, { label: '底片強度' }); } });
+  $('#editSide').addEventListener('mouseover', (e) => { const fl = e.target.closest('[data-film]'); if (fl && engine?.srcTex) { applyFilm(fl.dataset.film, E.edits.film?.amt || 100, true); return; } const t = e.target.closest('[data-preset]'); if (!t || !engine?.srcTex) return; const pr = [...BUILTIN_PRESETS, ...S.presets].find(p => p.id === t.dataset.preset); E.hover = { ...presetEdits(pr), crop: E.edits.crop }; if (E.hover.slim || E.hover.eyeEnlarge) {} draw(); });
+  $('#editSide').addEventListener('mouseout', (e) => { const t = e.target.closest('[data-preset],[data-film]'); if (!t) return; if (t.contains(e.relatedTarget)) return; E.hover = null; draw(); });
   $('#editBar').addEventListener('click', (e) => {
     const id = e.target.closest('[id]')?.id;
     if (id === 'tBefore') toggleSplit();
@@ -1297,6 +1560,7 @@ function bindGlobal() {
   let pan = null;
   $('#cv').addEventListener('pointerdown', (e) => {
     if (E.crop) return;
+    if (E.focusMode) { pickFocus(e); return; }
     if (E.healMode) { healDown(e); return; }
     if (E.zoom === 'fit') {
       const r = $('#cv').getBoundingClientRect(); const c = E.edits.crop;
@@ -1355,5 +1619,5 @@ function pasteSettings(ids) {
 }
 
 window.addEventListener('beforeunload', () => { if (E.photo) persistEdits(); });
-window.__capy = { S, E, eng: () => engine, refreshHeal: () => { E.healKey = ""; refreshHeal(); }, setEdit, renderTools, openEdit, computeGroups, exportRun: (ids, o) => runExport(ids, o) };
+window.__capy = { films: FILMS, filmPatch, optDialog: (ids) => aiOptimizeDialog(ids), S, E, eng: () => engine, refreshHeal: () => { E.healKey = ""; refreshHeal(); }, setEdit, renderTools, openEdit, computeGroups, exportRun: (ids, o) => runExport(ids, o) };
 boot();

@@ -1,7 +1,7 @@
 {
   "name": "capy-photo",
   "productName": "Capy Photo",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Capy Photo - RAW 照片管理與 AI 修圖",
   "main": "main.js",
   "author": "capywu",
@@ -13,7 +13,8 @@
   },
   "dependencies": {
     "@vladmandic/human": "^3.3.6",
-    "libraw-wasm": "^1.6.0"
+    "libraw-wasm": "^1.6.0",
+    "onnxruntime-web": "^1.31.1"
   },
   "devDependencies": {
     "@vladmandic/human-models": "^3.0.4",

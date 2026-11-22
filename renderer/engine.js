@@ -14,11 +14,13 @@ export const DEFAULT_EDITS = () => ({
   skyRep: 0, skyType: 'blue', fog: 0, dust: 0, cm: null, cmAmt: 0,
   hairAmt: 0, hairColor: 'brown', hairLum: 0, waist: 0, bodySlim: 0, water: 0, waterColor: 0,
   mist: 0, mistSize: 50, mistSoft: 40, mistWarm: true,
-  glow: 0, star: 0, twilight: 0, bgRep: 0, bgType: 'white', bgColor: '#ffffff', local: [], heal: [],
+  gradeSH: 200, gradeSS: 0, gradeHH: 40, gradeHS: 0, gradeBal: 0, chrome: 0, chromeBlue: 0, bleach: 0, bwFilter: 'none', bwToneH: 35, bwToneS: 0, film: null,
+  deblur: 0, defocus: 0, defocusR: 30, focus: null, focusAmt: 0, focusRange: 15,
+  glow: 0, halation: 0, star: 0, twilight: 0, bgRep: 0, bgType: 'white', bgColor: '#ffffff', local: [], heal: [],
   crop: { cx: 0.5, cy: 0.5, w: 1, h: 1, angle: 0, aspect: 'free' }
 });
 
-export const isDefault = (e) => JSON.stringify({ ...e, crop: null, enhanceVec: null, cm: null, local: (e.local || []).length, heal: (e.heal || []).length }) === JSON.stringify({ ...DEFAULT_EDITS(), crop: null, enhanceVec: null, cm: null, local: 0, heal: 0 }) && isFullCrop(e.crop);
+export const isDefault = (e) => JSON.stringify({ ...e, crop: null, enhanceVec: null, cm: null, focus: null, film: null, local: (e.local || []).length, heal: (e.heal || []).length }) === JSON.stringify({ ...DEFAULT_EDITS(), crop: null, enhanceVec: null, cm: null, focus: null, film: null, local: 0, heal: 0 }) && isFullCrop(e.crop);
 export const isFullCrop = (c) => !c || (c.w === 1 && c.h === 1 && c.cx === 0.5 && c.cy === 0.5 && !c.angle);
 
 // 智慧增強：一個滑桿帶動多項調整（依照片分析出的向量）
@@ -133,6 +135,26 @@ const FS_COMB = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uA, uB, uC, uD; uniform vec4 uW;
 void main(){ o = vec4(texture(uA, uv).rgb*uW.x + texture(uB, uv).rgb*uW.y + texture(uC, uv).rgb*uW.z + texture(uD, uv).rgb*uW.w, 1.); }`;
 
+// 失焦還原：Richardson–Lucy 反卷積（GPU 疊代）
+const FS_RLDIV = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uObs, uEst;
+void main(){ vec3 b = texture(uEst, uv).rgb; o = vec4(clamp(texture(uObs, uv).rgb / max(b, vec3(1e-4)), 0.2, 5.0), 1.); }`;
+const FS_RLMUL = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uEst, uC, uObs; uniform float uDamp; uniform vec2 uPx;
+void main(){
+  vec3 e = texture(uEst, uv).rgb * mix(vec3(1.0), texture(uC, uv).rgb, uDamp);
+  // 抑制振鈴：限制在原圖鄰近範圍內
+  vec3 mn = vec3(1e9), mx = vec3(-1e9);
+  for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++){ vec3 v = texture(uObs, uv + vec2(x,y)*uPx).rgb; mn = min(mn, v); mx = max(mx, v); }
+  o = vec4(clamp(e, mn*0.7, mx*1.3 + 0.003), 1.);
+}`;
+const FS_ADDD = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uA, uB, uC; uniform float uAmt;
+void main(){ vec3 a = texture(uA, uv).rgb; vec3 d = texture(uB, uv).rgb - texture(uC, uv).rgb; o = vec4(max(a + d * uAmt, vec3(0.)), 1.); }`;
+const FS_MIXW = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uA, uB; uniform float uAmt;
+void main(){ o = vec4(mix(texture(uA, uv).rgb, texture(uB, uv).rgb, uAmt), 1.); }`;
+
 // 背景權重（避免人物顏色滲進模糊背景）
 const FS_BGW = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o; uniform sampler2D uTex, uM2;
@@ -156,9 +178,11 @@ uniform float uHslH[8], uHslS[8], uHslL[8];
 uniform vec3 uSkinRef; uniform float uSpotR; uniform sampler2D uSPB, uBL, uM3; uniform int uHasBL; uniform int uHasSpot;
 uniform float uStructure, uMatte, uSkinHue, uSkinSat, uSkinLum, uFaceLight, uContour, uLips, uBrows, uBlush, uBgLight, uBgSat, uBgClean, uSkyRep, uFog, uDust, uCmAmt, uSkyBottom;
 uniform int uSkyType; uniform vec3 uCmS, uCmO;
-uniform sampler2D uM4; uniform float uHairAmt, uHairLum, uWater, uWaterCol, uGlow, uStar, uTwilight, uBgRep; uniform vec3 uHairCol, uBgCol, uBgCol2; uniform int uAlphaOut;
+uniform sampler2D uM4; uniform float uHal; uniform float uHairAmt, uHairLum, uWater, uWaterCol, uGlow, uStar, uTwilight, uBgRep; uniform vec3 uHairCol, uBgCol, uBgCol2; uniform int uAlphaOut;
 uniform int uLocN; uniform ivec4 uLocM; uniform vec4 uLocA[4];
 uniform float uMist, uMistSize, uMistSoft, uMistWarm;
+uniform float uFocusAmt, uFocusRange, uFocusD; uniform int uHasDepth;
+uniform vec3 uGradeS, uGradeH; uniform float uGradeBal, uChrome, uChromeBlue, uBleach; uniform vec3 uBwW, uBwTone;
 float hash2(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
 float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(hash2(i),hash2(i+vec2(1,0)),f.x), mix(hash2(i+vec2(0,1)),hash2(i+vec2(1,1)),f.x), f.y); }
 float fbm(vec2 p){ float v=0., a=0.5; for(int i=0;i<6;i++){ v+=a*vnoise(p); p*=2.03; a*=0.5; } return v; }
@@ -217,6 +241,26 @@ void main(){
   vec4 m3 = vec4(0.), m4 = vec4(0.);
   if(uHasMask==1){ vec2 mu = warpUV(su); m1 = texture(uM1, mu); m2 = texture(uM2, mu); m3 = texture(uM3, mu); m4 = texture(uM4, mu); }
   float L = lum(c);
+
+  // ── 改變焦點（依深度的鏡頭模糊）──
+  if(uFocusAmt > 0. && uHasDepth==1){
+    float dz = texture(uM4, warpUV(su)).b;
+    float coc = clamp((abs(dz - uFocusD) - uFocusRange) / 0.35, 0., 1.);
+    if(coc > 0.01){
+      float R = coc * uFocusAmt * 0.03; vec2 asp = vec2(uSrcPx.y/uSrcPx.x, 1.0);
+      vec3 acc = c; float wsum = 1.0;
+      for(int i=1;i<40;i++){ float fi = float(i); float r = sqrt(fi/40.0) * R; float a = fi * 2.39996;
+        vec2 off = vec2(cos(a), sin(a)) * r * asp;
+        float sd = texture(uM4, warpUV(su + off)).b; float scoc = clamp((abs(sd - uFocusD) - uFocusRange) / 0.35, 0., 1.);
+        // 清晰的前景不要被模糊到背景裡
+        float w = smoothstep(0.0, 1.0, (scoc * uFocusAmt * 0.03 + 0.002) / max(r, 1e-4));
+        vec3 sv = texture(uW, su + off).rgb; float br = 1.0 + 2.0 * smoothstep(0.6, 2.0, lum(sv));   // 亮點形成光斑
+        acc += sv * w * br; wsum += w * br; }
+      vec3 blurred = acc / wsum;
+      c = blurred; float k = coc;
+      b1 = mix(b1, blurred, k); b2 = mix(b2, blurred, k); bs = mix(bs, blurred, k); b3 = mix(b3, mix(b3, blurred, 0.5), k);
+    }
+  }
 
   // ── 降噪 ──
   if(uDenoise > 0.){ float e = clamp(abs(log2((lum(b3)+1e-4)/(L+1e-4)))*2.0, 0., 1.); c = mix(c, b2, uDenoise * (1.0 - 0.6*e)); }
@@ -301,7 +345,7 @@ void main(){
 
   // ── 霧氣（以位置、天空、人物估計遠近）──
   if(uFog > 0.){
-    float far_ = clamp(1.15 - su.y * 1.4, 0., 1.); far_ *= (1.0 - person) * (1.0 - 0.5*m2.g);
+    float far_ = uHasDepth==1 ? clamp((1.0 - m4.b) * 1.3 - 0.15, 0., 1.) : clamp(1.15 - su.y * 1.4, 0., 1.); far_ *= (uHasDepth==1 ? 1.0 : (1.0 - person)) * (1.0 - 0.5*m2.g);
     vec3 fc = vec3(0.46, 0.48, 0.52);
     c = mix(c, fc, clamp(uFog * pow(far_, 1.3) * 0.85, 0., 0.9));
     L = lum(c);
@@ -394,6 +438,8 @@ void main(){
     d = mix(d, d * vec3(0.93, 0.95, 1.04) * 0.94, (1.0 - skyW) * uTwilight * 0.6);
   }
   // 光源光暈 / 星芒
+  // 底片光暈（Halation）：強光外圍的紅橘色暈染（CineStill / Vision3 特色）
+  if(uHal > 0. && uHasBL==1){ vec3 bl = texture(uBL, su).rgb; float hl0 = smoothstep(0.08, 0.6, max(max(bl.r,bl.g),bl.b)); hl0 *= hl0 * (1.0 - 0.75*smoothstep(0.35, 0.9, lum(d))); d = 1.0 - (1.0 - d) * (1.0 - clamp(vec3(1.0, 0.3, 0.1) * hl0 * uHal * 2.2, 0., 1.)); }
   if(uGlow > 0. || uStar > 0.){
     if(uHasBL==1){ vec3 bl = texture(uBL, su).rgb; d = 1.0 - (1.0 - d) * (1.0 - clamp(bl * uGlow * 2.2 * vec3(1.0, 0.9, 0.78), 0., 1.)); }
     if(uStar > 0.){
@@ -447,9 +493,29 @@ void main(){
     vec3 r = vec3(yt.x + 1.402*yt.z, yt.x - 0.344136*yt.y - 0.714136*yt.z, yt.x + 1.772*yt.y);
     d = mix(d, clamp(r,0.,1.), uCmAmt);
   }
+  // 色彩濃度效果（Color Chrome）：高飽和色塊壓暗一點，增加層次
+  if(uChrome > 0. || uChromeBlue > 0.){
+    vec3 hv = rgb2hsv(d); float k = smoothstep(0.35, 0.85, hv.y) * uChrome;
+    float hb = hv.x * 360.0; float kb = smoothstep(0.25, 0.7, hv.y) * (1.0 - smoothstep(0., 40., abs(hb - 215.0))) * uChromeBlue;
+    d *= 1.0 - 0.22 * k - 0.25 * kb; d = mix(vec3(lum(d)), d, 1.0 + 0.15*k + 0.2*kb);
+  }
+  // 漂白略過（留銀）：亮度疊加、降飽和、高反差
+  if(uBleach > 0.){
+    float l6 = lum(d); vec3 ov = mix(2.0*d*l6, 1.0 - 2.0*(1.0-d)*(1.0-l6), step(0.5, l6));
+    d = mix(d, clamp(ov,0.,1.), uBleach * 0.75); d = mix(d, vec3(lum(d)), uBleach * 0.35);
+  }
+  // 分離色調：暗部 / 亮部各自染色（富士負片的色偏）
+  if(uGradeS.z > 0. || uGradeH.z > 0.){
+    float l7 = lum(d); float bal = uGradeBal * 0.25;
+    float ws = 1.0 - smoothstep(0.0, 0.55 + bal, l7), wh = smoothstep(0.45 + bal, 1.0, l7);
+    vec3 cs = hsv2rgb(vec3(uGradeS.x, 1.0, 1.0)) - 0.5, ch2 = hsv2rgb(vec3(uGradeH.x, 1.0, 1.0)) - 0.5;
+    d += cs * uGradeS.z * 0.22 * ws + ch2 * uGradeH.z * 0.22 * wh;
+    d = mix(vec3(l7), d, 1.0) + (l7 - lum(d));   // 保持亮度
+    d = clamp(d, 0., 1.);
+  }
   // 色調曲線
   d = curveF(d);
-  if(uBW > 0.5){ d = vec3(dot(d, vec3(0.3,0.59,0.11))); }
+  if(uBW > 0.5){ d = vec3(dot(d, uBwW)); if(uBwTone.z > 0.){ vec3 tc = hsv2rgb(vec3(uBwTone.x, 1.0, 1.0)); float l8 = d.r; d = mix(d, l8 * (tc / max(lum(tc),1e-3)), uBwTone.z * 0.5 * (1.0 - abs(l8 - 0.5)*1.2)); d = clamp(d,0.,1.); } }
   // 暗角
   if(uVignette != 0.){ vec2 q = (qv - 0.5) * vec2(uOutSize.x/uOutSize.y, 1.0) ; float r = length(q) / length(vec2(uOutSize.x/uOutSize.y,1.)*0.5); float v = smoothstep(0.35, 1.05, r); d *= 1.0 - uVignette * v * 0.85; d = max(d, vec3(0.)); }
   if(uGrain > 0.){ float n = hash(su * uSrcPx) - 0.5; d += n * uGrain * 0.12; }
@@ -521,7 +587,7 @@ export class Engine {
     const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    this.P = { base: program(gl, FS_BASE), copy: program(gl, FS_COPY), blur: program(gl, FS_BLUR), bil: program(gl, FS_BILATERAL), fin: program(gl, FS_FINAL), bgw: program(gl, FS_BGW), spot: program(gl, FS_SPOT), hi: program(gl, FS_HI), comb: program(gl, FS_COMB) };
+    this.P = { base: program(gl, FS_BASE), copy: program(gl, FS_COPY), blur: program(gl, FS_BLUR), bil: program(gl, FS_BILATERAL), fin: program(gl, FS_FINAL), bgw: program(gl, FS_BGW), spot: program(gl, FS_SPOT), hi: program(gl, FS_HI), comb: program(gl, FS_COMB), rldiv: program(gl, FS_RLDIV), rlmul: program(gl, FS_RLMUL), mixw: program(gl, FS_MIXW), addd: program(gl, FS_ADDD) };
     this.t = {}; this.dirty = true; this.pins = []; this.hasMask = false;
     this.baseLUT = defaultBaseLUT(); this.baseSat = 1;
     this.curveLut = curveLUT(DEFAULT_EDITS().curve);
@@ -578,8 +644,8 @@ export class Engine {
   setMasks(m) {
     const gl = this.gl;
     for (const k of ['m1', 'm2', 'm3', 'm4']) if (this[k] && this[k] !== this.emptyMask) gl.deleteTexture(this[k]);
-    if (!m) { this.m1 = this.m2 = this.m3 = this.m4 = this.emptyMask; this.hasMask = false; this.dirty = true; return; }
-    this.m1 = this.texRGBA8(m.w, m.h, m.m1); this.m2 = this.texRGBA8(m.w, m.h, m.m2); this.m3 = m.m3 ? this.texRGBA8(m.w, m.h, m.m3) : this.emptyMask; this.m4 = m.m4 ? this.texRGBA8(m.w, m.h, m.m4) : this.emptyMask; this.skyBottom = m.skyBottom || 0.5;
+    if (!m) { this.hasDepth = false; this.depthAt = null; this.m1 = this.m2 = this.m3 = this.m4 = this.emptyMask; this.hasMask = false; this.dirty = true; return; }
+    this.m1 = this.texRGBA8(m.w, m.h, m.m1); this.m2 = this.texRGBA8(m.w, m.h, m.m2); this.m3 = m.m3 ? this.texRGBA8(m.w, m.h, m.m3) : this.emptyMask; this.m4 = m.m4 ? this.texRGBA8(m.w, m.h, m.m4) : this.emptyMask; this.skyBottom = m.skyBottom || 0.5; this.hasDepth = !!m.depth; this.depthAt = m.depth ? (x, y) => { const X = Math.max(0, Math.min(m.w - 1, Math.round(x * m.w))), Y = Math.max(0, Math.min(m.h - 1, Math.round(y * m.h))); let s2 = 0, n = 0; for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) { const xx = Math.max(0, Math.min(m.w - 1, X + dx)), yy = Math.max(0, Math.min(m.h - 1, Y + dy)); s2 += m.depth[yy * m.w + xx]; n++; } return s2 / n; } : null;
     this.hasMask = true; this.dirty = true; if (m.skinRef) this.skinRef = m.skinRef; this.faceFrac = m.faceFrac || 0.25;
   }
   // pins: [{x,y,r,type:'mag'|'push', s, dx, dy}]（座標為來源 0..1）
@@ -606,8 +672,8 @@ export class Engine {
 
   // 依參數建立中間層（白平衡/曝光/液化改變時才重算）
   prepare(e) {
-    const wantBloom = (e.mist > 0 || e.glow > 0); const bsz = Math.round((e.mistSize ?? 50) / 10);
-    const key = JSON.stringify([e.temp, e.tint, e.exposure, this.pins, this.srcW, this.srcH, this.hasMask, wantBloom, bsz, this.lutVer]);
+    const wantBloom = !this.lite && (e.mist > 0 || e.glow > 0 || e.halation > 0); const bsz = Math.round((e.mistSize ?? 50) / 10);
+    const key = JSON.stringify([e.defocus, e.defocusR, e.temp, e.tint, e.exposure, this.pins, this.srcW, this.srcH, this.hasMask, wantBloom, bsz, this.lutVer]);
     if (!this.dirty && key === this.prepKey) return;
     this.prepKey = key; this.dirty = false;
     const gl = this.gl; const W = this.srcW, H = this.srcH;
@@ -620,11 +686,31 @@ export class Engine {
       const o = this.target('O', W, H); this.draw(P, o.fb, W, H); this.bindSrc(P); gl.uniform3fv(P.u.uMul, [1, 1, 1]); gl.uniform1i(P.u.uPins, 0); this.quad();
       this.origDirty = false;
     }
+    if (e.defocus > 0) {
+      // 以長邊比例決定模糊半徑；大半徑在縮小的影像上疊代（可救回的細節本來就在那個尺度），再把差值加回原圖
+      const sigmaFull = (0.5 + (e.defocusR ?? 30) / 100 * 11.5) * Math.max(W, H) / 3000;
+      const f = Math.max(1, sigmaFull / 2.5); const Wl = Math.max(16, Math.round(W / f)), Hl = Math.max(16, Math.round(H / f)); const sigma = sigmaFull / f;
+      const obs = this.resample(w0.tex, 'RLO', Wl, Hl);
+      let est = this.resample(w0.tex, 'RLA', Wl, Hl), alt = this.target('RLB', Wl, Hl);
+      for (let i = 0; i < 16; i++) {
+        const be = this.blurInto(est.tex, 'RLE', Wl, Hl, sigma);
+        const ratio = this.target('RLR', Wl, Hl); this.draw(this.P.rldiv, ratio.fb, Wl, Hl); this.bind(this.P.rldiv, 'uObs', 0, obs.tex); this.bind(this.P.rldiv, 'uEst', 1, be.tex); this.quad();
+        const cc = this.blurInto(ratio.tex, 'RLC', Wl, Hl, sigma);
+        const PM = this.P.rlmul; this.draw(PM, alt.fb, Wl, Hl); this.bind(PM, 'uEst', 0, est.tex); this.bind(PM, 'uC', 1, cc.tex); this.bind(PM, 'uObs', 2, obs.tex); gl.uniform1f(PM.u.uDamp, 0.9); gl.uniform2f(PM.u.uPx, 1 / Wl, 1 / Hl); this.quad();
+        [est, alt] = [alt, est];
+      }
+      const cp = this.target('RLW', W, H); this.draw(this.P.copy, cp.fb, W, H); this.bind(this.P.copy, 'uTex', 0, w0.tex); this.quad();
+      const PD = this.P.addd; this.draw(PD, w0.fb, W, H); this.bind(PD, 'uA', 0, cp.tex); this.bind(PD, 'uB', 1, est.tex); this.bind(PD, 'uC', 2, obs.tex); gl.uniform1f(PD.u.uAmt, Math.min(1.5, e.defocus / 100 * 1.2)); this.quad();
+    }
     const long = Math.max(W, H), sc = (n) => [Math.max(8, Math.round(W * n / long)), Math.max(8, Math.round(H * n / long))];
     this.blurInto(w0.tex, 'B1', W, H, 1.3);
     // 雙邊濾波：降噪（1/2）與修膚（固定 1024 長邊）
     const h2 = this.resample(w0.tex, 'H2', Math.ceil(W / 2), Math.ceil(H / 2));
     const PB = this.P.bil;
+    if (this.lite) {
+      // 輕量模式（AI 最佳化搜尋用）：省略雙邊濾波與斑點偵測
+      const [sw, shh] = sc(256); this.t.B2 = this.resample(h2.tex, 'B2', h2.w, h2.h); this.t.BS = this.resample(w0.tex, 'BS', sw, shh);
+    } else {
     const b2 = this.target('B2', h2.w, h2.h); this.draw(PB, b2.fb, h2.w, h2.h); this.bind(PB, 'uTex', 0, h2.tex); gl.uniform2f(PB.u.uPx, 1 / h2.w, 1 / h2.h); gl.uniform1f(PB.u.uStep, 1.0); gl.uniform1f(PB.u.uRange, 0.25); this.quad();
     const [sw, shh] = sc(1024);
     const s0 = this.resample(w0.tex, 'S0', sw, shh);
@@ -637,6 +723,7 @@ export class Engine {
       const r = Math.max(1.5, Math.min(6, (this.faceFrac || 0.25) * 1024 * 0.03));
       this.draw(PS, sp.fb, sw, shh); this.bind(PS, 'uTex', 0, s0.tex); this.bind(PS, 'uM1', 1, this.m1); this.bind(PS, 'uM2', 2, this.m2); gl.uniform2f(PS.u.uR, r / sw, r / shh); gl.uniform2f(PS.u.uR2, 2.0 / sw, 2.0 / shh); this.warpUniforms(PS); this.quad();
       this.blurInto(sp.tex, 'SPB', sw, shh, Math.max(1, r * 0.5));
+    }
     }
     const [w3, h3] = sc(768);
     const q3 = this.resample(w0.tex, 'Q3', w3, h3); this.blurInto(q3.tex, 'B3', w3, h3, 2.2);
@@ -682,7 +769,7 @@ export class Engine {
     tx.forEach(([u, n], i) => this.bind(P, u, i, this.t[n].tex));
     this.bind(P, 'uM1', 6, this.m1); this.bind(P, 'uM2', 7, this.m2); this.bind(P, 'uBase', 8, this.baseTex); this.bind(P, 'uM4', 9, this.m4);
     this.bind(P, 'uOrig', 10, this.t.O.tex);
-    const hasSP = this.hasMask && this.t.SPB; gl.uniform1i(P.u.uHasSpot, hasSP ? 1 : 0); this.bind(P, 'uSPB', 13, hasSP ? this.t.SPB.tex : this.emptyMask); const hasBL = !!(this.t.BL && (e.mist > 0 || e.glow > 0)); gl.uniform1i(P.u.uHasBL, hasBL ? 1 : 0); this.bind(P, 'uBL', 14, hasBL ? this.t.BL.tex : this.emptyMask); this.bind(P, 'uM3', 15, this.m3);
+    const hasSP = this.hasMask && this.t.SPB; gl.uniform1i(P.u.uHasSpot, hasSP ? 1 : 0); this.bind(P, 'uSPB', 13, hasSP ? this.t.SPB.tex : this.emptyMask); const hasBL = !!(this.t.BL && (e.mist > 0 || e.glow > 0 || e.halation > 0)); gl.uniform1i(P.u.uHasBL, hasBL ? 1 : 0); this.bind(P, 'uBL', 14, hasBL ? this.t.BL.tex : this.emptyMask); this.bind(P, 'uM3', 15, this.m3);
     const hasBG = this.hasMask && this.t.BG1; gl.uniform1i(P.u.uHasBG, hasBG ? 1 : 0);
     this.bind(P, 'uBG1', 11, hasBG ? this.t.BG1.tex : this.emptyMask); this.bind(P, 'uBG2', 12, hasBG ? this.t.BG2.tex : this.emptyMask);
     gl.uniform1i(P.u.uHasOrig, opts.split != null ? 1 : 0); gl.uniform1f(P.u.uSplit, opts.split != null ? opts.split : -1);
@@ -705,10 +792,16 @@ export class Engine {
     const HAIR = { brown: '#7a4a2a', chestnut: '#5a2e1a', blonde: '#d8b878', wine: '#7a1f35', black: '#1a1716', gray: '#a8a8ad', ash: '#8c8478', pink: '#d8899e' };
     const hx = (c) => { const n = parseInt(c.slice(1), 16); return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255]; };
     f('uHairAmt', (e.hairAmt || 0) / 100); f('uHairLum', (e.hairLum || 0) / 100); gl.uniform3fv(P.u.uHairCol, hx(HAIR[e.hairColor] || e.hairColor || '#7a4a2a'));
-    f('uWater', (e.water || 0) / 100); f('uWaterCol', (e.waterColor || 0) / 100); f('uGlow', (e.glow || 0) / 100); f('uStar', (e.star || 0) / 100); f('uTwilight', (e.twilight || 0) / 100);
+    f('uWater', (e.water || 0) / 100); f('uWaterCol', (e.waterColor || 0) / 100); f('uGlow', (e.glow || 0) / 100); f('uHal', (e.halation || 0) / 100); f('uStar', (e.star || 0) / 100); f('uTwilight', (e.twilight || 0) / 100);
     const BGS = { white: ['#ffffff', '#ffffff'], black: ['#0c0c0e', '#0c0c0e'], gray: ['#8d9096', '#5d6066'], studio: ['#6f7a88', '#2a2f38'], warm: ['#f3e3cf', '#c9a888'], blue: ['#9cc6ef', '#3a6fb0'], custom: [e.bgColor || '#ffffff', e.bgColor || '#ffffff'] };
     const bg = BGS[e.bgType] || BGS.white; f('uBgRep', (e.bgRep || 0) / 100); gl.uniform3fv(P.u.uBgCol, hx(bg[0])); gl.uniform3fv(P.u.uBgCol2, hx(bg[1]));
     gl.uniform1i(P.u.uAlphaOut, opts.alpha ? 1 : 0);
+    const BWF = { none: [0.3, 0.59, 0.11], ye: [0.42, 0.52, 0.06], r: [0.72, 0.28, 0.0], g: [0.22, 0.72, 0.06] };
+    gl.uniform3fv(P.u.uBwW, BWF[e.bwFilter] || BWF.none); gl.uniform3f(P.u.uBwTone, (e.bwToneH ?? 35) / 360, 0, (e.bwToneS || 0) / 100);
+    gl.uniform3f(P.u.uGradeS, (e.gradeSH ?? 200) / 360, 0, (e.gradeSS || 0) / 100); gl.uniform3f(P.u.uGradeH, (e.gradeHH ?? 40) / 360, 0, (e.gradeHS || 0) / 100);
+    f('uGradeBal', (e.gradeBal || 0) / 100); f('uChrome', (e.chrome || 0) / 100); f('uChromeBlue', (e.chromeBlue || 0) / 100); f('uBleach', (e.bleach || 0) / 100);
+    f('uFocusAmt', e.focus ? (e.focusAmt || 0) / 100 : 0); f('uFocusRange', (e.focusRange ?? 15) / 100 * 0.4); gl.uniform1i(P.u.uHasDepth, this.hasDepth ? 1 : 0);
+    f('uFocusD', e.focus && this.depthAt ? this.depthAt(e.focus.x, e.focus.y) : 0.5);
     f('uMist', (e.mist || 0) / 100); f('uMistSize', (e.mistSize ?? 50) / 100); f('uMistSoft', (e.mistSoft ?? 40) / 100); f('uMistWarm', e.mistWarm === false ? 0 : 1);
     const L = (e.local || []).filter(l => l.on !== false).slice(0, 4); const MT = { person: 0, bg: 1, sky: 2, skin: 3, hair: 4, water: 5, plants: 6, face: 7 };
     gl.uniform1i(P.u.uLocN, L.length); const lm = [0, 0, 0, 0], la = new Float32Array(16);
