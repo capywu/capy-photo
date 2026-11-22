@@ -1,0 +1,78 @@
+{
+  "name": "capy-photo",
+  "productName": "Capy Photo",
+  "version": "1.1.0",
+  "description": "Capy Photo - RAW 照片管理與 AI 修圖",
+  "main": "main.js",
+  "author": "capywu",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable",
+    "dist:mac": "electron-builder --mac dmg"
+  },
+  "dependencies": {
+    "@vladmandic/human": "^3.3.6",
+    "libraw-wasm": "^1.6.0"
+  },
+  "devDependencies": {
+    "@vladmandic/human-models": "^3.0.4",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "resedit": "^2.0.3"
+  },
+  "build": {
+    "appId": "com.capywu.capyphoto",
+    "productName": "Capy Photo",
+    "artifactName": "CapyPhoto-${version}-Setup.${ext}",
+    "files": [
+      "main.js",
+      "preload.js",
+      "lib/**",
+      "renderer/**",
+      "models/**",
+      "build/icon.png",
+      "package.json",
+      "!node_modules/@vladmandic/human/dist/human.node*",
+      "!node_modules/@vladmandic/human/dist/*.map",
+      "!node_modules/@vladmandic/human/dist/human.js",
+      "!node_modules/@vladmandic/human/src/**",
+      "!node_modules/@vladmandic/human/types/**",
+      "!node_modules/libraw-wasm/dist/*.map"
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "asar": true,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Capy Photo",
+      "artifactName": "CapyPhoto-${version}-Setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "CapyPhoto-${version}-Portable.${ext}"
+    },
+    "mac": {
+      "icon": "build/icon.png",
+      "category": "public.app-category.photography",
+      "target": [
+        "dmg"
+      ],
+      "artifactName": "CapyPhoto-${version}-mac-${arch}.${ext}",
+      "identity": null
+    },
+    "afterPack": "build/afterPack.js"
+  },
+  "repository": "https://github.com/capywu/capy-photo"
+}

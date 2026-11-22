@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' app: blob: data:; script-src 'self' app: 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' app: blob:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: blob: data:; connect-src 'self' app: blob: data:">
+<title>Capy Photo</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="top">
+  <div class="logo"><i></i>Capy Photo <small id="ver">V1.0</small></div>
+  <div class="tabs">
+    <div class="tab on" data-view="lib">圖庫</div>
+    <div class="tab" data-view="edit">編輯</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="btn" id="btnImport">＋ 匯入照片 ▾</div>
+  <div class="btn p" id="btnExport">匯出</div>
+</div>
+<div class="main">
+  <!-- 圖庫 -->
+  <section id="lib" class="view on">
+    <aside class="side" id="libSide"></aside>
+    <div class="center">
+      <div class="bar" id="libBar"></div>
+      <div id="gridWrap"><div class="grid" id="grid"></div>
+        <div class="loupe hidden" id="loupe"></div>
+        <div class="empty hidden" id="empty"></div>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+    <aside class="rside" id="libInfo"></aside>
+  </section>
+  <!-- 編輯 -->
+  <section id="edit" class="view">
+    <aside class="side" id="editSide"></aside>
+    <div class="center">
+      <div class="bar" id="editBar"></div>
+      <div class="viewer" id="viewer">
+        <canvas id="cv"></canvas>
+        <img id="placeholder" class="hidden">
+        <div id="cropOverlay" class="hidden"></div>
+        <div id="splitLine" class="hidden"><b>⇔</b><span class="l">修圖前</span><span class="r">修圖後</span></div>
+        <div id="busy" class="hidden"><div class="spin"></div><span></span></div>
+      </div>
+      <div class="film" id="film"></div>
+    </div>
+    <aside class="rside" id="tools"></aside>
+  </section>
+</div>
+<div id="menu" class="menu hidden"></div>
+<div id="modal" class="modalWrap hidden"></div>
+<div id="toast" class="toast hidden"></div>
+<canvas id="bgcv" width="16" height="16" style="display:none"></canvas>
+<script type="module" src="app.js"></script>
+</body>
+</html>
