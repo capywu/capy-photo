@@ -678,12 +678,12 @@ void main(){
   // 髮色
   if(m4.r > 0.002 && (uHairAmt > 0. || uHairLum != 0.)){
     // 保留原本頭髮的明暗紋理（相對於頭髮平均亮度），換成目標髮色
-    float hl2 = lum(d); float rel = pow(clamp(hl2 / max(uHairRefL, 0.03), 0., 4.), 0.85);
+    float hl2 = lum(d); float rel = pow(clamp(hl2 / max(uHairRefL, 0.03), 0., 4.), 0.85); rel = 0.38 + 0.62 * rel; // 很黑的髮根、頭頂也要看得到新髮色
     vec3 tgt = clamp(uHairCol * rel, 0., 1.); tgt += max(hl2 - 0.85, 0.) * 0.8;
     vec3 nd = mix(d, mix(d, tgt, 0.9), uHairAmt); nd *= 1.0 + uHairLum * 0.45;
     // 遮罩邊緣（髮絲之間）透出的白衣服、天空等：比頭髮亮很多又不飽和的像素不換色，避免染到背景
     float mxc = max(d.r, max(d.g, d.b)); float sat = (mxc - min(d.r, min(d.g, d.b))) / max(mxc, 0.02);
-    float protect = smoothstep(1.9, 3.3, hl2 / max(uHairRefL, 0.03)) * (1.0 - smoothstep(0.18, 0.45, sat));
+    float protect = smoothstep(1.7, 3.0, hl2 / max(uHairRefL, 0.03)) * (1.0 - smoothstep(0.2, 0.55, sat));
     d = mix(d, clamp(nd,0.,1.), m4.r * (1.0 - protect * (1.0 - smoothstep(0.85, 1.0, m4.r) * 0.5)));
   }
   // 水面

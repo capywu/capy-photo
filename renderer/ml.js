@@ -55,7 +55,7 @@ export async function parseHair(imgData, W, H, box, out, outFace, outSkin) {
   const fw = box[2] - box[0], fh = box[3] - box[1], F = Math.max(fw, fh); const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
   const c = new OffscreenCanvas(W, H); c.getContext('2d').putImageData(imgData, 0, 0);
   const N = 512; const r = new OffscreenCanvas(N, N); const rx = r.getContext('2d', { willReadFrequently: true }); rx.imageSmoothingQuality = 'high';
-  const crops = [[F * 1.7, cx, cy + F * 0.02, true], [F * 2.6, cx, cy + F * 0.3, true], [F * 4.4, cx, cy + F * 1.35, false]];
+  const crops = [[F * 2.0, cx, cy - F * 0.15, true], [F * 3.0, cx, cy + F * 0.2, true], [F * 4.6, cx, cy + F * 1.2, false]];
   for (const [sz, ccx, ccy, faceToo] of crops) {
     const X0 = ccx - sz / 2, Y0 = ccy - sz / 2;
     rx.fillStyle = '#000'; rx.fillRect(0, 0, N, N); rx.drawImage(c, X0, Y0, sz, sz, 0, 0, N, N);

@@ -126,6 +126,14 @@ export function sharpness(ctx, box, W, H) {
   const m = s / n; return s2 / n - m * m;
 }
 
+export function boxF(a, W, H, r) {
+  const S = new Float64Array((W + 1) * (H + 1));
+  for (let y = 0; y < H; y++) { let row = 0; for (let x = 0; x < W; x++) { row += a[y * W + x]; S[(y + 1) * (W + 1) + x + 1] = S[y * (W + 1) + x + 1] + row; } }
+  const o = new Float32Array(W * H);
+  for (let y = 0; y < H; y++) { const y0 = Math.max(0, y - r), y1 = Math.min(H, y + r + 1); for (let x = 0; x < W; x++) { const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1);
+    o[y * W + x] = (S[y1 * (W + 1) + x1] - S[y0 * (W + 1) + x1] - S[y1 * (W + 1) + x0] + S[y0 * (W + 1) + x0]) / ((x1 - x0) * (y1 - y0)); } }
+  return o;
+}
 // 導向濾波：讓遮罩邊緣貼齊照片的邊緣（髮絲、肩膀輪廓）
 export function guidedFilter(I, p, W, H, r, eps) {
   const box = (a) => { // 積分圖 box filter
@@ -256,6 +264,7 @@ export async function buildMasks(imgData) {
     try { const m = f.mesh; let bx = [1e9, 1e9, -1e9, -1e9]; for (const p of m) { bx[0] = Math.min(bx[0], p[0]); bx[1] = Math.min(bx[1], p[1]); bx[2] = Math.max(bx[2], p[0]); bx[3] = Math.max(bx[3], p[1]); }
       await parseHair(imgData, W, H, bx, hairA, faceP, skinP); parsed = true; } catch (err) { console.warn('hair parse', err); }
   }
+  const rawHair = Float32Array.from(hairA);
   if (parsed && person) for (let i = 0; i < W * H; i++) { const pv = person[i * 4 + 3] / 255; hairA[i] = Math.min(1, Math.max(0, (hairA[i] - 0.25) / 0.5)) * Math.min(1, 0.35 + pv * 1.2); }
   else if (parsed) for (let i = 0; i < W * H; i++) hairA[i] = Math.min(1, Math.max(0, (hairA[i] - 0.25) / 0.5));
   if (person && !parsed) for (const f of faces) {
@@ -284,12 +293,15 @@ export async function buildMasks(imgData) {
   }
   // 扣除皮膚（臉與身體）
   const hairK = new Float32Array(W * H).fill(1);
+  // 紋理強度：髮絲有細密的方向性紋理，皮膚平滑；用來區分顏色接近膚色的淺色髮絲與手、皮膚
+  const tex = (() => { const g = new Float32Array(W * H); for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; g[i] = Math.abs(gray[i + 1] - gray[i - 1]) + Math.abs(gray[i + W] - gray[i - W]); } return boxF(g, W, H, Math.max(1, Math.round(Math.max(W, H) / 700))); })();
   { const skd = skX.getImageData(0, 0, W, H).data, fcd = fcX.getImageData(0, 0, W, H).data;
     // 與膚色太接近的不算頭髮
     let ref = null; if (skinSamples.length) ref = ycc(skinSamples.reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], [0, 0, 0]).map(v => v / skinSamples.length));
     const d = imgData.data;
     for (let i = 0; i < W * H; i++) { if (!hairA[i]) continue; let k = parsed ? (ref ? (() => { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); const dc = Math.hypot(c[1] - ref[1], c[2] - ref[2]); const dy = Math.abs(c[0] - ref[0]) / Math.max(ref[0], 1); return 1 - (1 - Math.min(1, Math.max(0, (dc - 11) / 8))) * (1 - Math.min(1, Math.max(0, (dy - 0.25) / 0.2))); })() : 1) : (1 - skd[i * 4 + 3] / 255) * (1 - fcd[i * 4 + 3] / 255);
       if (ref && !parsed) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); const dc = Math.hypot(c[1] - ref[1], c[2] - ref[2]); k *= Math.min(1, Math.max(0, (dc - 6) / 10) + (c[0] < ref[0] * 0.35 ? 1 : 0)); }
+      if (parsed) k = Math.max(k, Math.min(1, Math.max(0, (tex[i] - 0.03) / 0.05)) * (1 - fcd[i * 4 + 3] / 255));
       hairA[i] *= Math.min(1, k); hairK[i] = Math.min(1, k); }
     // 頭髮顏色模型：用最確定是頭髮的像素建立顏色分布，差太多的（例如撥頭髮的手、肩膀）排除
     if (parsed) { let n = 0; const m = [0, 0, 0], q = [0, 0, 0];
@@ -300,6 +312,38 @@ export async function buildMasks(imgData) {
           hairA[i] *= k2; hairK[i] *= k2; } } } }
   let hair = hairA;
   if (faces.length && person) { hair = guidedFilter(gray, hairA, W, H, Math.max(2, Math.round(Math.max(W, H) / 300)), 4e-4); for (let i = 0; i < W * H; i++) hair[i] *= hairK[i]; }
+  // 髮絲延伸：手撥起、被風吹開、散在背景上的細髮。靠近頭髮、顏色像頭髮、和周圍背景有落差且有髮絲紋理的像素補進來
+  if (parsed && faces.length) {
+    const d = imgData.data; let n = 0; const mu = [0, 0, 0], q2 = [0, 0, 0];
+    for (let i = 0; i < W * H; i++) if (hair[i] > 0.6) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); for (let k = 0; k < 3; k++) { mu[k] += c[k]; q2[k] += c[k] * c[k]; } n++; }
+    if (n > 300) {
+      const sd = [0, 1, 2].map(k => Math.max([45, 9, 9][k], Math.sqrt(Math.max(0, q2[k] / n - (mu[k] / n) ** 2)))); for (let k = 0; k < 3; k++) mu[k] /= n;
+      // 範圍：頭髮往外約一個臉寬
+      const fwMax = Math.max(...faces.map(f => dist(f.mesh[234], f.mesh[454]))); const R = Math.max(4, Math.round(fwMax * 0.9));
+      const hb = new Float32Array(W * H); for (let i = 0; i < W * H; i++) hb[i] = hair[i] > 0.5 ? 1 : 0; const near = boxF(hb, W, H, R);
+      const Yc = new Float32Array(W * H), Cb = new Float32Array(W * H), Cr = new Float32Array(W * H);
+      for (let i = 0; i < W * H; i++) { const c = ycc([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]); Yc[i] = c[0]; Cb[i] = c[1]; Cr[i] = c[2]; }
+      const rb = Math.max(3, Math.round(Math.max(W, H) / 120)); const bY = boxF(Yc, W, H, rb), bB = boxF(Cb, W, H, rb), bR = boxF(Cr, W, H, rb);
+      const sk = skX.getImageData(0, 0, W, H).data; const sref = skinSamples.length ? ycc(skinSamples.reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], [0, 0, 0]).map(v => v / skinSamples.length)) : null;
+      // 皮膚附近（手、手指輪廓）不長髮絲
+      const skl = new Float32Array(W * H); if (sref) for (let i = 0; i < W * H; i++) skl[i] = Math.hypot(Cb[i] - sref[1], Cr[i] - sref[2]) < 10 && Yc[i] > sref[0] * 0.45 ? 1 : 0; const skn = boxF(skl, W, H, Math.max(2, Math.round(Math.max(W, H) / 250)));
+      const grow = new Float32Array(W * H);
+      for (let i = 0; i < W * H; i++) { if (near[i] <= 0 || hair[i] > 0.7) continue; if (person && person[i * 4 + 3] > 38 && rawHair[i] < 0.2) continue; if ((!person || person[i * 4 + 3] <= 38) && rawHair[i] < 0.2) { const zb = Math.sqrt(((bY[i] - mu[0]) / sd[0]) ** 2 + ((bB[i] - mu[1]) / sd[1]) ** 2 + ((bR[i] - mu[2]) / sd[2]) ** 2); if (zb < 2.6) continue; } // 背景本身顏色像頭髮（碎石、暗處）時不長，避免誤選 // 衣服、身體上不長（那裡交給臉部解析）
+        const z = Math.sqrt(((Yc[i] - mu[0]) / sd[0]) ** 2 + ((Cb[i] - mu[1]) / sd[1]) ** 2 + ((Cr[i] - mu[2]) / sd[2]) ** 2); const like = Math.min(1, Math.max(0, 1 - (z - 1.8) / 1.4)); if (like <= 0) continue;
+        const contrast = Math.min(1, (Math.abs(Yc[i] - bY[i]) / 12 + Math.hypot(Cb[i] - bB[i], Cr[i] - bR[i]) / 8));
+        const tx = Math.min(1, Math.max(0, (tex[i] - 0.025) / 0.05)); let v = like * Math.min(1, contrast) * (0.35 + 0.65 * tx);
+        if (sref && Math.hypot(Cb[i] - sref[1], Cr[i] - sref[2]) < 9 && tx < 0.5) v *= 0.2; // 手、皮膚
+        v *= (1 - sk[i * 4 + 3] / 255) * (1 - Math.min(1, Math.max(0, (skn[i] - 0.12) / 0.2)) * 0.9); grow[i] = v; }
+      // 只保留和頭髮連在一起的部分（從頭髮往外逐步擴張）
+      const keep = new Uint8Array(W * H); const st = []; for (let i = 0; i < W * H; i++) if (hair[i] > 0.5) { keep[i] = 1; st.push(i); }
+      while (st.length) { const i = st.pop(); const x = i % W, y = (i / W) | 0; for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]) { const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue; const j = yy * W + xx; if (keep[j] || grow[j] < 0.3) continue; keep[j] = 1; st.push(j); } }
+      const g2 = new Float32Array(W * H); for (let i = 0; i < W * H; i++) g2[i] = keep[i] && hair[i] <= 0.5 ? grow[i] : 0;
+      const gs = guidedFilter(gray, g2, W, H, 1, 1e-3); for (let i = 0; i < W * H; i++) if (keep[i]) hair[i] = Math.max(hair[i], Math.min(1, Math.max(g2[i], gs[i]) * 1.3));
+    }
+  }
+  // 髮絲之間透出的衣服、背景：比頭髮平均亮很多又平滑（沒有髮絲紋理）的地方降低
+  if (parsed) { let sw = 0, sg = 0; for (let i = 0; i < W * H; i++) if (hair[i] > 0.8) { sw++; sg += gray[i]; } const mg = sw ? sg / sw : 0.2;
+    for (let i = 0; i < W * H; i++) { if (hair[i] <= 0.01) continue; const br = Math.min(1, Math.max(0, (gray[i] / Math.max(mg, 0.03) - 1.5) / 0.8)); const sm = 1 - Math.min(1, Math.max(0, (tex[i] - 0.015) / 0.04)); hair[i] *= 1 - br * sm * 0.85; } }
   // 臉部範圍：用臉部解析的結果（自動排除瀏海、頭髮、耳朵），邊緣依照片細節貼齊
   let faceR = null; if (parsed) { const fp = new Float32Array(W * H); for (let i = 0; i < W * H; i++) fp[i] = Math.min(1, Math.max(0, (faceP[i] - 0.3) / 0.4)) * (1 - Math.min(1, hair[i] * 1.3)); faceR = guidedFilter(gray, fp, W, H, Math.max(2, Math.round(Math.max(W, H) / 400)), 2e-3); }
 
