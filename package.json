@@ -48,7 +48,8 @@
       "!node_modules/onnxruntime-web/dist/ort.{js,mjs,min.js,min.mjs,bundle.min.mjs}",
       "!node_modules/onnxruntime-web/dist/ort.webgpu.{js,mjs,min.js,bundle.min.mjs}",
       "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{asyncify,jspi}.*",
-      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{mjs,wasm}"
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{mjs,wasm}",
+      "!build/afterPack.js"
     ],
     "directories": {
       "output": "dist",
