@@ -106,7 +106,14 @@ function setupIpc() {
     if (r.response !== 0) return false;
     store.deleteProject(id); return true;
   });
-  ipcMain.handle('project:open', (_e, id) => store.loadProject(id));
+  ipcMain.handle('project:open', (_e, id) => {
+    store.loadProject(id);
+    // 舊版匯入的一般照片（JPG 等）沒有讀 EXIF，開啟專案時補讀一次
+    const raw = store.projects.get(id); let changed = false;
+    for (const ph of raw?.photos || []) { if (ph.isRaw || ph.infoV >= 2) continue; const inf = rawmeta.readImageInfo(ph.path); if (inf) ph.info = { ...inf, ...Object.fromEntries(Object.entries(ph.info || {}).filter(([, v]) => v)) }; ph.infoV = 2; changed = true; }
+    if (changed) store.save(id);
+    return store.loadProject(id);
+  });
 
   ipcMain.handle('sky:pick', async (_e, kind) => {
     const r = kind === 'lut' ? await dialog.showOpenDialog(win, { title: '選擇 LUT 檔（.cube）', properties: ['openFile'], filters: [{ name: '3D LUT', extensions: ['cube'] }] })
@@ -130,7 +137,7 @@ function setupIpc() {
       const ext = path.extname(f).toLowerCase();
       const isRaw = RAW_EXT.includes(ext);
       let st; try { st = fs.statSync(f); } catch { continue; }
-      const info = isRaw ? (rawmeta.readInfo(f) || {}) : {};
+      const info = isRaw ? (rawmeta.readInfo(f) || {}) : (rawmeta.readImageInfo(f) || {});
       const root = (roots || []).find(r => f.startsWith(r));
       const folder = root ? (path.relative(root, path.dirname(f)) || path.basename(root)) : path.basename(path.dirname(f));
       const p = store.addPhoto(projectId, { path: f, name: path.basename(f), ext: ext.slice(1).toUpperCase(), isRaw, size: st.size, mtime: st.mtimeMs, folder, info });

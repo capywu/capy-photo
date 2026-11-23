@@ -1,7 +1,7 @@
 {
   "name": "capy-photo",
   "productName": "Capy Photo",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Capy Photo - RAW 照片管理與 AI 修圖",
   "main": "main.js",
   "author": "capywu",
@@ -48,8 +48,7 @@
       "!node_modules/onnxruntime-web/dist/ort.{js,mjs,min.js,min.mjs,bundle.min.mjs}",
       "!node_modules/onnxruntime-web/dist/ort.webgpu.{js,mjs,min.js,bundle.min.mjs}",
       "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{asyncify,jspi}.*",
-      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{mjs,wasm}",
-      "!build/afterPack.js"
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{mjs,wasm}"
     ],
     "directories": {
       "output": "dist",
